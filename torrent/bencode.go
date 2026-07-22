@@ -3,6 +3,7 @@ package torrent
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"strconv"
 )
 
@@ -20,12 +21,14 @@ const (
 // list: l[]e
 // dictionary: keys and values
 
+type BencodingDict map[string]Bencoding
+
 type Bencoding struct {
 	kind    BencodingKind
 	array   []Bencoding
 	str     string
 	integer int64
-	dict    map[string]Bencoding
+	dict    BencodingDict
 }
 
 func StringBencoding(s string) Bencoding {
@@ -52,7 +55,7 @@ func (b *Bencoding) String() (string, bool) {
 	return b.str, true
 }
 
-func (b *Bencoding) Dict() (map[string]Bencoding, bool) {
+func (b *Bencoding) Dict() (BencodingDict, bool) {
 	if b.kind != DictKind {
 		return map[string]Bencoding{}, false
 	}
@@ -83,20 +86,22 @@ type BReader struct {
 // using a reader vs a...
 
 func (r *BReader) decodeBString() (Bencoding, error) {
-	strLenByte, err := r.r.ReadByte()
+	lengthBytes, err := r.r.ReadSlice(':')
 
 	if err != nil {
 		return Bencoding{}, err
 	}
 
-	bStrBytes, err := strconv.Atoi(string(strLenByte))
+	lengthBytes = lengthBytes[:len(lengthBytes)-1]
+
+	bStrBytes, err := strconv.ParseInt(string(lengthBytes), 10, 64)
 	if err != nil {
 		return Bencoding{}, err
 	}
 
 	strBuffer := make([]byte, bStrBytes)
 
-	if _, err = r.r.Read(strBuffer); err != nil {
+	if _, err = io.ReadFull(r.r, strBuffer); err != nil {
 		return Bencoding{}, err
 	}
 
@@ -113,19 +118,24 @@ func (r *BReader) decodeBInteger() (Bencoding, error) {
 		return Bencoding{}, fmt.Errorf("invalid integer prefix")
 	}
 
-	line, err := r.r.ReadSlice('e')
+	line, err := r.r.ReadString('e')
+
+	if err != nil {
+		return Bencoding{}, err
+	}
+	line = line[:len(line)-1]
+
+	value, err := strconv.ParseInt(
+		string(line),
+		10,
+		64,
+	)
 
 	if err != nil {
 		return Bencoding{}, err
 	}
 
-	val, err := strconv.Atoi(string(line))
-
-	if err != nil {
-		return Bencoding{}, err
-	}
-
-	return IntegerBencoding(int64(val)), nil
+	return IntegerBencoding(int64(value)), nil
 }
 
 func (r *BReader) decode() (Bencoding, error) {
@@ -134,7 +144,7 @@ func (r *BReader) decode() (Bencoding, error) {
 		return Bencoding{}, err
 	}
 
-	switch BencodingKind(prefix[1]) {
+	switch BencodingKind(prefix[0]) {
 	case DictKind:
 		return r.decodeBDict()
 	case IntegerKind:
@@ -159,6 +169,19 @@ func (r *BReader) decodeBDict() (Bencoding, error) {
 	bEncodingMap := map[string]Bencoding{}
 
 	for {
+		next, err := r.r.Peek(1)
+
+		if err != nil {
+			return Bencoding{}, err
+		}
+		if next[0] == 'e' {
+			if _, err := r.r.ReadByte(); err != nil {
+				return Bencoding{}, err
+			}
+
+			break
+		}
+
 		key, err := r.decodeBString()
 		if err != nil {
 			return Bencoding{}, err
@@ -171,13 +194,6 @@ func (r *BReader) decodeBDict() (Bencoding, error) {
 
 		bEncodingMap[key.str] = val
 
-		if n, err := r.r.Peek(1); err == nil && n[0] == 'e' {
-			break
-		}
-
-	}
-	if _, err := r.r.ReadByte(); err != nil {
-		return Bencoding{}, err
 	}
 
 	return Bencoding{kind: DictKind, dict: bEncodingMap}, nil
@@ -197,16 +213,67 @@ func (r *BReader) decodeBList() (Bencoding, error) {
 	vals := make([]Bencoding, 0)
 
 	for {
+
+		next, err := r.r.Peek(1)
+
+		if err != nil {
+			return Bencoding{}, err
+		}
+		if next[0] == 'e' {
+			if _, err := r.r.ReadByte(); err != nil {
+				return Bencoding{}, err
+			}
+
+			break
+		}
+
 		val, err := r.decode()
 		if err != nil {
 			return Bencoding{}, err
 		}
 		vals = append(vals, val)
 
-		if p, err := r.r.Peek(1); err == nil && p[0] == 'e' {
-			break
-		}
 	}
 
 	return Bencoding{kind: ListKind, array: vals}, nil
+}
+
+func (b BencodingDict) String(key string) (string, bool) {
+
+	val, ok := b[key]
+
+	if !ok {
+		return "", false
+	}
+
+	return val.String()
+}
+
+func (b BencodingDict) Int(key string) (int64, bool) {
+	val, ok := b[key]
+
+	if !ok {
+		return 0, false
+	}
+	return val.Int()
+}
+
+func (b BencodingDict) Dict(key string) (BencodingDict, bool) {
+	val, ok := b[key]
+
+	if !ok {
+		return BencodingDict{}, false
+	}
+
+	return val.Dict()
+}
+
+func (b BencodingDict) List(key string) ([]Bencoding, bool) {
+	val, ok := b["key"]
+
+	if !ok {
+		return []Bencoding{}, false
+	}
+
+	return val.List()
 }
