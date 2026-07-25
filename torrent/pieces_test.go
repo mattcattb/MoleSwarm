@@ -120,7 +120,7 @@ func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	defer file.Close()
 	torrent.file = file
 
-	peer := &Peer{}
+	peer := &peer{}
 	request := protocol.BlockRequest{
 		PieceIndex: 0,
 		Begin:      0,
@@ -142,7 +142,7 @@ func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	if len(torrent.pending) != 0 {
 		t.Fatal("pending request was not removed")
 	}
-	if got := torrent.BytesLeft(); got != 0 {
+	if got := torrent.pieces.BytesLeft(); got != 0 {
 		t.Fatalf("bytes left = %d, want 0", got)
 	}
 }

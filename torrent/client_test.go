@@ -46,6 +46,16 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan error, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- routedSession.run(ctx, ready)
+	}()
+	if err := <-ready; err != nil {
+		cancel()
+		t.Fatalf("run routed torrent: %v", err)
+	}
+
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- client.Serve(ctx, listener)
@@ -83,6 +93,9 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	cancel()
 	if err := <-serveErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("serve error = %v, want context canceled", err)
+	}
+	if err := <-runErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("torrent run error = %v, want context canceled", err)
 	}
 }
 
