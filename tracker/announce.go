@@ -80,7 +80,7 @@ func parseUint64Query(query url.Values, key string) (uint64, error) {
 		return 0, errInvalidAnnounceRequest
 	}
 
-	value, err := strconv.ParseUint(query.Get(key), 10, 50)
+	value, err := strconv.ParseUint(query.Get(key), 10, 64)
 	if err != nil {
 		return 0, errInvalidAnnounceRequest
 	}
@@ -107,22 +107,22 @@ func decodeAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
 	query := request.URL.Query()
 
 	infoHashValue, err := parseStringQuery(query, "info_hash")
-	if err != nil {
-		return AnnounceRequest{}, err
+	if err != nil || len(infoHashValue) != len(protocol.InfoHash{}) {
+		return AnnounceRequest{}, errInvalidAnnounceRequest
 	}
 	var infoHash protocol.InfoHash
 	copy(infoHash[:], infoHashValue)
 
 	peerIDValue, err := parseStringQuery(query, "peer_id")
-	if err != nil {
-		return AnnounceRequest{}, err
+	if err != nil || len(peerIDValue) != len(protocol.PeerID{}) {
+		return AnnounceRequest{}, errInvalidAnnounceRequest
 	}
 	var peerID protocol.PeerID
 	copy(peerID[:], peerIDValue)
 
 	port, err := parseUint16Query(query, "port")
-	if err != nil {
-		return AnnounceRequest{}, err
+	if err != nil || port == 0 {
+		return AnnounceRequest{}, errInvalidAnnounceRequest
 	}
 	uploaded, err := parseUint64Query(query, "uploaded")
 	if err != nil {
@@ -137,6 +137,12 @@ func decodeAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
 		return AnnounceRequest{}, err
 	}
 
+	compact := query.Get("compact") == "1"
+	event := AnnounceEvent(query.Get("event"))
+	if event != "" && event != StartedEvent && event != CompletedEvent && event != StoppedEvent {
+		return AnnounceRequest{}, errInvalidAnnounceRequest
+	}
+
 	return AnnounceRequest{
 		InfoHash:   infoHash,
 		PeerID:     peerID,
@@ -144,7 +150,8 @@ func decodeAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
 		Uploaded:   uploaded,
 		Downloaded: downloaded,
 		Left:       left,
-		Event:      AnnounceEvent(query.Get("event")),
+		Compact:    compact,
+		Event:      event,
 	}, nil
 }
 
@@ -229,8 +236,31 @@ func parsePeer(value protocol.Bencoding) (Peer, error) {
 	return Peer{PeerID: peerID, IP: ip, Port: uint16(port)}, nil
 }
 
-func encodeTrackerResponse(response AnnounceResponse) (protocol.Bencoding, error) {
-	interval := protocol.IntegerBencoding(int64(response.Interval))
+func encodeTrackerResponse(response AnnounceResponse, compact bool) (protocol.Bencoding, error) {
+	if response.Interval < 0 || response.Interval%time.Second != 0 {
+		return protocol.Bencoding{}, fmt.Errorf("tracker interval %s is not a whole number of seconds", response.Interval)
+	}
+
+	interval := protocol.IntegerBencoding(int64(response.Interval / time.Second))
+	if compact {
+		peers := make([]byte, 0, len(response.Peers)*6)
+		for _, peer := range response.Peers {
+			if !peer.IP.Is4() {
+				continue
+			}
+			ip := peer.IP.As4()
+			peers = append(peers, ip[:]...)
+			var port [2]byte
+			binary.BigEndian.PutUint16(port[:], peer.Port)
+			peers = append(peers, port[:]...)
+		}
+
+		return protocol.DictBencoding(map[string]protocol.Bencoding{
+			"interval": interval,
+			"peers":    protocol.StringBencoding(string(peers)),
+		}), nil
+	}
+
 	peers := make([]protocol.Bencoding, 0, len(response.Peers))
 	for _, peer := range response.Peers {
 		peers = append(peers, protocol.DictBencoding(protocol.BencodingDict{

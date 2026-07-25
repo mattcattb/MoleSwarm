@@ -159,3 +159,91 @@ func TestAnnounceHonorsContextCancellation(t *testing.T) {
 		t.Fatalf("announce error = %v, want context cancellation", err)
 	}
 }
+
+func TestServerAnnounceReturnsOtherPeersInRequestedFormat(t *testing.T) {
+	server := httptest.NewServer(NewServer(30 * time.Second))
+	defer server.Close()
+
+	infoHash := protocol.InfoHash{1}
+	firstPeerID := protocol.PeerID{2}
+	secondPeerID := protocol.PeerID{3}
+
+	first, err := Announce(context.Background(), server.URL, AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   firstPeerID,
+		Port:     6881,
+		Left:     42,
+		Event:    StartedEvent,
+	})
+	if err != nil {
+		t.Fatalf("announce first peer: %v", err)
+	}
+	if len(first.Peers) != 0 {
+		t.Fatalf("first peer received %d peers, want 0", len(first.Peers))
+	}
+
+	second, err := Announce(context.Background(), server.URL, AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   secondPeerID,
+		Port:     6882,
+		Left:     21,
+		Event:    StartedEvent,
+	})
+	if err != nil {
+		t.Fatalf("announce second peer: %v", err)
+	}
+	if got, want := second.Interval, 30*time.Second; got != want {
+		t.Fatalf("interval = %s, want %s", got, want)
+	}
+	if got, want := len(second.Peers), 1; got != want {
+		t.Fatalf("peer count = %d, want %d", got, want)
+	}
+	if got, want := second.Peers[0].PeerID, firstPeerID; got != want {
+		t.Errorf("peer ID = %x, want %x", got, want)
+	}
+	if got, want := second.Peers[0].Port, uint16(6881); got != want {
+		t.Errorf("peer port = %d, want %d", got, want)
+	}
+
+	compact, err := Announce(context.Background(), server.URL, AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   secondPeerID,
+		Port:     6882,
+		Left:     21,
+		Compact:  true,
+	})
+	if err != nil {
+		t.Fatalf("announce compact response: %v", err)
+	}
+	if got, want := len(compact.Peers), 1; got != want {
+		t.Fatalf("compact peer count = %d, want %d", got, want)
+	}
+	if got, want := compact.Peers[0].Port, uint16(6881); got != want {
+		t.Errorf("compact peer port = %d, want %d", got, want)
+	}
+}
+
+func TestServerPrunesStalePeersBeforePeerSelection(t *testing.T) {
+	server := NewServer(time.Second)
+	server.peerTTL = time.Second
+	infoHash := protocol.InfoHash{1}
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	server.announce(AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   protocol.PeerID{2},
+		Port:     6881,
+		Event:    StartedEvent,
+	}, netip.MustParseAddr("192.0.2.1"), now)
+
+	response := server.announce(AnnounceRequest{
+		InfoHash: infoHash,
+		PeerID:   protocol.PeerID{3},
+		Port:     6882,
+		Event:    StartedEvent,
+	}, netip.MustParseAddr("192.0.2.2"), now.Add(2*time.Second))
+
+	if got := len(response.Peers); got != 0 {
+		t.Fatalf("peer count after pruning = %d, want 0", got)
+	}
+}
