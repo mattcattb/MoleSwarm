@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/mattcattb/go-torrent/protocol"
 )
@@ -13,15 +14,32 @@ type Torrent struct {
 
 	pieces  PieceSet
 	file    *os.File
-	pending map[protocol.BlockRequest]*Peer
+	pending map[protocol.BlockRequest]*peer
 
-	Peers      map[protocol.PeerID]*Peer
-	peerEvents chan PeerEvent
+	peers      map[protocol.PeerID]*peer
+	peerEvents chan peerEvent
+	commands   chan torrentCommand
 
 	TrackerID string
 
 	uploaded   uint64
 	downloaded uint64
+
+	lifecycleMu sync.Mutex
+	running     bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	closeErr    error
+}
+
+type torrentCommand struct {
+	stats chan<- torrentStats
+}
+
+type torrentStats struct {
+	uploaded   uint64
+	downloaded uint64
+	left       uint64
 }
 
 func NewTorrent(meta protocol.MetaInfo) (*Torrent, error) {
@@ -33,9 +51,10 @@ func NewTorrent(meta protocol.MetaInfo) (*Torrent, error) {
 	return &Torrent{
 		Meta:       meta,
 		pieces:     pieces,
-		pending:    make(map[protocol.BlockRequest]*Peer),
-		Peers:      make(map[protocol.PeerID]*Peer),
-		peerEvents: make(chan PeerEvent),
+		pending:    make(map[protocol.BlockRequest]*peer),
+		peers:      make(map[protocol.PeerID]*peer),
+		peerEvents: make(chan peerEvent),
+		commands:   make(chan torrentCommand),
 	}, nil
 }
 
@@ -60,7 +79,7 @@ func OpenTorrent(meta protocol.MetaInfo, outputPath string) (*Torrent, error) {
 
 const maxPeers = int(5)
 
-func (t *Torrent) pendingCount(peer *Peer) int {
+func (t *Torrent) pendingCount(peer *peer) int {
 
 	count := 0
 
@@ -73,11 +92,14 @@ func (t *Torrent) pendingCount(peer *Peer) int {
 	return count
 }
 
-func (t *Torrent) registerPeer(ctx context.Context, peer *Peer) bool {
-	if _, exists := t.Peers[peer.ID]; exists {
+func (t *Torrent) registerPeer(ctx context.Context, peer *peer) bool {
+	if peer == nil || len(t.peers) >= maxPeers {
 		return false
 	}
-	t.Peers[peer.ID] = peer
+	if _, exists := t.peers[peer.id]; exists {
+		return false
+	}
+	t.peers[peer.id] = peer
 	go peer.readLoop(ctx, t.peerEvents)
 	go peer.writeLoop(ctx, t.peerEvents)
 
@@ -85,74 +107,145 @@ func (t *Torrent) registerPeer(ctx context.Context, peer *Peer) bool {
 }
 
 func (t *Torrent) Close() error {
-	for _, peer := range t.Peers {
-		if peer.Conn != nil {
-			_ = peer.Conn.Close()
-		}
+	t.lifecycleMu.Lock()
+	if !t.running {
+		err := t.closeFile()
+		t.lifecycleMu.Unlock()
+		return err
 	}
 
-	if t.file == nil {
-		return nil
-	}
+	cancel := t.cancel
+	done := t.done
+	t.lifecycleMu.Unlock()
 
-	err := t.file.Close()
-	t.file = nil
+	cancel()
+	<-done
+
+	t.lifecycleMu.Lock()
+	err := t.closeErr
+	t.lifecycleMu.Unlock()
 	return err
 }
 
-func (t *Torrent) BytesLeft() uint64 {
-	return t.pieces.BytesLeft()
+func (t *Torrent) attachPeer(ctx context.Context, peer *peer) bool {
+	t.lifecycleMu.Lock()
+	running := t.running
+	done := t.done
+	t.lifecycleMu.Unlock()
+	if !running {
+		return false
+	}
+
+	select {
+	case t.peerEvents <- peerEvent{peer: peer, Connected: true}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-done:
+		return false
+	}
 }
 
-func (t *Torrent) Run(ctx context.Context) error {
+func (t *Torrent) stats(ctx context.Context) (torrentStats, error) {
+	t.lifecycleMu.Lock()
+	running := t.running
+	done := t.done
+	t.lifecycleMu.Unlock()
+	if !running {
+		return torrentStats{}, fmt.Errorf("torrent is not running")
+	}
+
+	response := make(chan torrentStats, 1)
+	select {
+	case t.commands <- torrentCommand{stats: response}:
+	case <-ctx.Done():
+		return torrentStats{}, ctx.Err()
+	case <-done:
+		return torrentStats{}, fmt.Errorf("torrent stopped before reporting stats")
+	}
+
+	select {
+	case stats := <-response:
+		return stats, nil
+	case <-ctx.Done():
+		return torrentStats{}, ctx.Err()
+	case <-done:
+		return torrentStats{}, fmt.Errorf("torrent stopped before reporting stats")
+	}
+}
+
+func (t *Torrent) run(ctx context.Context, ready chan<- error) (err error) {
+	runCtx, cancel := context.WithCancel(ctx)
+
+	t.lifecycleMu.Lock()
+	if t.running {
+		t.lifecycleMu.Unlock()
+		ready <- fmt.Errorf("torrent is already running")
+		cancel()
+		return fmt.Errorf("torrent is already running")
+	}
+	t.running = true
+	t.cancel = cancel
+	t.done = make(chan struct{})
+	t.closeErr = nil
+	t.lifecycleMu.Unlock()
+	ready <- nil
+
+	defer func() {
+		cancel()
+		t.closePeers()
+
+		t.lifecycleMu.Lock()
+		t.closeErr = t.closeFile()
+		t.running = false
+		t.cancel = nil
+		close(t.done)
+		if err == nil && t.closeErr != nil {
+			err = t.closeErr
+		}
+		t.lifecycleMu.Unlock()
+	}()
+
 	for {
 		select {
 		case event := <-t.peerEvents:
+			if event.Connected {
+				if !t.registerPeer(runCtx, event.peer) && event.peer != nil && event.peer.conn != nil {
+					_ = event.peer.conn.Close()
+				}
+				continue
+			}
 			if event.Err != nil {
-				t.removePeer(event.Peer)
+				t.removePeer(event.peer)
 				continue
 			}
 
-			if err := t.handlePeerMessage(event.Peer, event.Message); err != nil {
-				t.removePeer(event.Peer)
+			if err := t.handlePeerMessage(event.peer, event.Message); err != nil {
+				t.removePeer(event.peer)
 			}
 
-		case <-ctx.Done():
-			return ctx.Err()
+		case command := <-t.commands:
+			command.stats <- torrentStats{
+				uploaded:   t.uploaded,
+				downloaded: t.downloaded,
+				left:       t.pieces.BytesLeft(),
+			}
+
+		case <-runCtx.Done():
+			return runCtx.Err()
 		}
 	}
-}
-
-func (t *Torrent) NextRequest(peer *Peer) error {
-	if peer == nil {
-		return fmt.Errorf("cannot request a block without a peer")
-	}
-	if peer.State.PeerChoking || !peer.State.AmInterested {
-		return nil
-	}
-
-	request, ok, err := t.reserveNextRequest(peer)
-	if err != nil || !ok {
-		return err
-	}
-
-	if err := peer.sendMessage(protocol.Request{Block: request}); err != nil {
-		delete(t.pending, request)
-		return err
-	}
-
-	return nil
 }
 
 const maxPendingPerPeer = 8
 
-func (t *Torrent) fillRequestWindow(peer *Peer) error {
+func (t *Torrent) fillRequestWindow(peer *peer) error {
 
 	if peer == nil {
 		return nil
 	}
 
-	if peer.State.PeerChoking || !peer.State.AmInterested {
+	if peer.state.PeerChoking || !peer.state.AmInterested {
 		return nil
 	}
 
@@ -176,10 +269,10 @@ func (t *Torrent) fillRequestWindow(peer *Peer) error {
 	return nil
 }
 
-func (t *Torrent) reserveNextRequest(peer *Peer) (protocol.BlockRequest, bool, error) {
+func (t *Torrent) reserveNextRequest(peer *peer) (protocol.BlockRequest, bool, error) {
 	for index := 0; index < t.pieces.Count(); index++ {
 		pieceIndex := uint32(index)
-		if t.pieces.IsComplete(pieceIndex) || !peer.HasPiece(pieceIndex) {
+		if t.pieces.IsComplete(pieceIndex) || !peer.hasPiece(pieceIndex) {
 			continue
 		}
 
@@ -201,7 +294,7 @@ func (t *Torrent) reserveNextRequest(peer *Peer) (protocol.BlockRequest, bool, e
 	return protocol.BlockRequest{}, false, nil
 }
 
-func (t *Torrent) receiveBlock(peer *Peer, message protocol.Piece) (bool, error) {
+func (t *Torrent) receiveBlock(peer *peer, message protocol.Piece) (bool, error) {
 	request := protocol.BlockRequest{
 		PieceIndex: message.PieceIndex,
 		Begin:      message.Begin,
@@ -232,8 +325,8 @@ func (t *Torrent) receiveBlock(peer *Peer, message protocol.Piece) (bool, error)
 	return true, nil
 }
 
-func (t *Torrent) serveBlock(peer *Peer, request protocol.BlockRequest) error {
-	if peer == nil || peer.State.AmChoking {
+func (t *Torrent) serveBlock(peer *peer, request protocol.BlockRequest) error {
+	if peer == nil || peer.state.AmChoking {
 		return nil
 	}
 
@@ -253,7 +346,7 @@ func (t *Torrent) serveBlock(peer *Peer, request protocol.BlockRequest) error {
 	return nil
 }
 
-func (t *Torrent) handlePeerMessage(peer *Peer, message protocol.Message) error {
+func (t *Torrent) handlePeerMessage(peer *peer, message protocol.Message) error {
 	if peer == nil {
 		return fmt.Errorf("peer message has no peer")
 	}
@@ -263,20 +356,20 @@ func (t *Torrent) handlePeerMessage(peer *Peer, message protocol.Message) error 
 		return nil
 
 	case protocol.Choke:
-		peer.State.PeerChoking = true
+		peer.state.PeerChoking = true
 		t.releasePendingRequests(peer)
 		return nil
 
 	case protocol.Unchoke:
-		peer.State.PeerChoking = false
+		peer.state.PeerChoking = false
 		return t.fillRequestWindow(peer)
 
 	case protocol.Interested:
-		peer.State.PeerInterested = true
+		peer.state.PeerInterested = true
 		return nil
 
 	case protocol.NotInterested:
-		peer.State.PeerInterested = false
+		peer.state.PeerInterested = false
 		return nil
 
 	case protocol.Have:
@@ -288,7 +381,7 @@ func (t *Torrent) handlePeerMessage(peer *Peer, message protocol.Message) error 
 		return t.fillRequestWindow(peer)
 
 	case protocol.Bitfield:
-		peer.Bitfield = append(peer.Bitfield[:0], message.Bits...)
+		peer.bitfield = append(peer.bitfield[:0], message.Bits...)
 		if err := t.updateInterest(peer); err != nil {
 			return err
 		}
@@ -315,17 +408,17 @@ func (t *Torrent) handlePeerMessage(peer *Peer, message protocol.Message) error 
 	return nil
 }
 
-func (t *Torrent) updateInterest(peer *Peer) error {
+func (t *Torrent) updateInterest(peer *peer) error {
 	interested := false
 	for index := 0; index < t.pieces.Count(); index++ {
 		pieceIndex := uint32(index)
-		if !t.pieces.IsComplete(pieceIndex) && peer.HasPiece(pieceIndex) {
+		if !t.pieces.IsComplete(pieceIndex) && peer.hasPiece(pieceIndex) {
 			interested = true
 			break
 		}
 	}
 
-	if interested == peer.State.AmInterested {
+	if interested == peer.state.AmInterested {
 		return nil
 	}
 
@@ -338,20 +431,20 @@ func (t *Torrent) updateInterest(peer *Peer) error {
 		return err
 	}
 
-	peer.State.AmInterested = interested
+	peer.state.AmInterested = interested
 	return nil
 }
 
-func (t *Torrent) setPeerPiece(peer *Peer, index uint32) {
+func (t *Torrent) setPeerPiece(peer *peer, index uint32) {
 	byteIndex := index / 8
-	if int(byteIndex) >= len(peer.Bitfield) {
-		peer.Bitfield = append(peer.Bitfield, make([]byte, int(byteIndex)+1-len(peer.Bitfield))...)
+	if int(byteIndex) >= len(peer.bitfield) {
+		peer.bitfield = append(peer.bitfield, make([]byte, int(byteIndex)+1-len(peer.bitfield))...)
 	}
 
-	peer.Bitfield[byteIndex] |= byte(1 << (7 - index%8))
+	peer.bitfield[byteIndex] |= byte(1 << (7 - index%8))
 }
 
-func (t *Torrent) releasePendingRequests(peer *Peer) {
+func (t *Torrent) releasePendingRequests(peer *peer) {
 	for request, assignedPeer := range t.pending {
 		if assignedPeer == peer {
 			delete(t.pending, request)
@@ -360,23 +453,43 @@ func (t *Torrent) releasePendingRequests(peer *Peer) {
 }
 
 func (t *Torrent) broadcastMessage(message protocol.Message) {
-	for _, peer := range t.Peers {
+	for _, peer := range t.peers {
 		if err := peer.sendMessage(message); err != nil {
 			t.removePeer(peer)
 		}
 	}
 }
 
-func (t *Torrent) removePeer(peer *Peer) {
+func (t *Torrent) removePeer(peer *peer) {
 	if peer == nil {
 		return
 	}
 
 	t.releasePendingRequests(peer)
-	if current, ok := t.Peers[peer.ID]; ok && current == peer {
-		delete(t.Peers, peer.ID)
+	if current, ok := t.peers[peer.id]; ok && current == peer {
+		delete(t.peers, peer.id)
 	}
-	if peer.Conn != nil {
-		_ = peer.Conn.Close()
+	if peer.conn != nil {
+		_ = peer.conn.Close()
 	}
+}
+
+func (t *Torrent) closePeers() {
+	for _, peer := range t.peers {
+		if peer.conn != nil {
+			_ = peer.conn.Close()
+		}
+	}
+	t.peers = make(map[protocol.PeerID]*peer)
+	t.pending = make(map[protocol.BlockRequest]*peer)
+}
+
+func (t *Torrent) closeFile() error {
+	if t.file == nil {
+		return nil
+	}
+
+	err := t.file.Close()
+	t.file = nil
+	return err
 }

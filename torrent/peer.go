@@ -14,56 +14,33 @@ const peerWriteQueueSize = 32
 
 var errPeerWriteQueueFull = errors.New("peer write queue is full")
 
-type PeerState struct {
+type peerState struct {
 	AmChoking      bool
 	AmInterested   bool
 	PeerChoking    bool
 	PeerInterested bool
 }
 
-type Peer struct {
-	Conn     net.Conn
-	ID       protocol.PeerID
-	InfoHash protocol.InfoHash
-	State    PeerState
-	Bitfield []byte
+type peer struct {
+	conn     net.Conn
+	id       protocol.PeerID
+	infoHash protocol.InfoHash
+	state    peerState
+	bitfield []byte
 	outgoing chan protocol.Message
 }
 
-func DialPeer(ctx context.Context, peerRecord tracker.Peer) (net.Conn, error) {
+func dialPeer(ctx context.Context, peerRecord tracker.Peer) (net.Conn, error) {
 	dialer := net.Dialer{}
 	return dialer.DialContext(ctx, "tcp", netip.AddrPortFrom(peerRecord.IP, peerRecord.Port).String())
 }
 
-func CompleteHandshake(conn net.Conn, info protocol.MetaInfo, peerID protocol.PeerID) (*Peer, error) {
-
-	if err := protocol.WriteHandshake(conn, protocol.Handshake{
-		InfoHash: info.InfoHash,
-		PeerID:   peerID,
-		Protocol: protocol.PeerProtocol,
-	}); err != nil {
-		return nil, err
-	}
-
-	// if connection dropped, does not have the info hash!
-	// uhhh maybe we await the other peer handshake? hmm
-
-	handshakeMessage, err := protocol.ReadHandshake(conn)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return CreatePeer(conn, handshakeMessage), nil
-}
-
-func CreatePeer(conn net.Conn, handshake protocol.Handshake) *Peer {
-
-	return &Peer{
-		Conn:     conn,
-		ID:       handshake.PeerID,
-		InfoHash: handshake.InfoHash,
-		State: PeerState{
+func newPeer(conn net.Conn, handshake protocol.Handshake) *peer {
+	return &peer{
+		conn:     conn,
+		id:       handshake.PeerID,
+		infoHash: handshake.InfoHash,
+		state: peerState{
 			AmChoking:   true,
 			PeerChoking: true,
 		},
@@ -71,37 +48,38 @@ func CreatePeer(conn net.Conn, handshake protocol.Handshake) *Peer {
 	}
 }
 
-func (p *Peer) HasPiece(index uint32) bool {
+func (p *peer) hasPiece(index uint32) bool {
 	byteIndex := index / 8
-	if int(byteIndex) >= len(p.Bitfield) {
+	if int(byteIndex) >= len(p.bitfield) {
 		return false
 	}
 
 	mask := byte(1 << (7 - index%8))
-	return p.Bitfield[byteIndex]&mask != 0
+	return p.bitfield[byteIndex]&mask != 0
 }
 
-func (p *Peer) sendMessage(message protocol.Message) error {
+func (p *peer) sendMessage(message protocol.Message) error {
 	if p.queue(message) {
 		return nil
 	}
 	return errPeerWriteQueueFull
 }
 
-type PeerEvent struct {
-	Peer    *Peer
-	Message protocol.Message
-	Err     error
+type peerEvent struct {
+	peer      *peer
+	Connected bool
+	Message   protocol.Message
+	Err       error
 }
 
-func (p *Peer) readLoop(ctx context.Context, events chan<- PeerEvent) {
+func (p *peer) readLoop(ctx context.Context, events chan<- peerEvent) {
 
 	for {
 
-		msg, err := protocol.ReadMessage(p.Conn)
+		msg, err := protocol.ReadMessage(p.conn)
 
-		event := PeerEvent{
-			Peer:    p,
+		event := peerEvent{
+			peer:    p,
 			Message: msg,
 			Err:     err,
 		}
@@ -119,7 +97,7 @@ func (p *Peer) readLoop(ctx context.Context, events chan<- PeerEvent) {
 	}
 }
 
-func (p *Peer) queue(message protocol.Message) bool {
+func (p *peer) queue(message protocol.Message) bool {
 	select {
 	case p.outgoing <- message:
 		return true
@@ -129,31 +107,23 @@ func (p *Peer) queue(message protocol.Message) bool {
 	}
 }
 
-func (p *Peer) setPieceHave(index uint32) {
+func (p *peer) setPieceHave(index uint32) {
 	byteIndex := index / 8
 	mask := byte(1 << (7 - index%8))
-	if int(byteIndex) >= len(p.Bitfield) {
-		p.Bitfield = append(p.Bitfield, make([]byte, int(byteIndex)+1-len(p.Bitfield))...)
+	if int(byteIndex) >= len(p.bitfield) {
+		p.bitfield = append(p.bitfield, make([]byte, int(byteIndex)+1-len(p.bitfield))...)
 	}
-	p.Bitfield[byteIndex] |= mask
+	p.bitfield[byteIndex] |= mask
 }
 
-/*
-func (p *Peer) HandleIncomingPieces()
-
-func (p *Peer) CanRequest() bool {
-
-}
-*/
-
-func (p *Peer) writeLoop(ctx context.Context, events chan<- PeerEvent) {
+func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
 	for {
 
 		select {
 		case message := <-p.outgoing:
-			if err := protocol.WriteMessage(p.Conn, message); err != nil {
+			if err := protocol.WriteMessage(p.conn, message); err != nil {
 				select {
-				case events <- PeerEvent{Peer: p, Err: err}:
+				case events <- peerEvent{peer: p, Err: err}:
 				case <-ctx.Done():
 
 				}

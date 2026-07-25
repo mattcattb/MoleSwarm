@@ -79,21 +79,29 @@ func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) err
 		return fmt.Errorf("run torrent: info hash %x is not registered", infoHash)
 	}
 
+	ready := make(chan error, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- torrent.run(ctx, ready)
+	}()
+	if err := <-ready; err != nil {
+		return err
+	}
+
 	response, err := c.announce(ctx, torrent, tracker.StartedEvent)
 	if err != nil {
+		_ = torrent.Close()
+		<-runErr
 		return err
 	}
 
 	for _, candidate := range response.Peers {
-		if len(torrent.Peers) >= maxPeers {
-			break
-		}
 		if err := c.connect(ctx, torrent, candidate); err != nil {
 			continue
 		}
 	}
 
-	return torrent.Run(ctx)
+	return <-runErr
 }
 
 func (c *Client) Serve(ctx context.Context, listener net.Listener) error {
@@ -188,8 +196,8 @@ func (c *Client) routeIncomingPeer(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	peer := CreatePeer(conn, handshake)
-	if !torrent.registerPeer(ctx, peer) {
+	peer := newPeer(conn, handshake)
+	if !torrent.attachPeer(ctx, peer) {
 		_ = conn.Close()
 	}
 }
@@ -207,11 +215,16 @@ func (c *Client) announce(ctx context.Context, torrent *Torrent, event tracker.A
 	port := c.listenPort
 	c.mu.RUnlock()
 
+	stats, err := torrent.stats(ctx)
+	if err != nil {
+		return tracker.AnnounceResponse{}, err
+	}
+
 	return tracker.Announce(ctx, torrent.Meta.Announce, tracker.AnnounceRequest{
 		Port:       port,
-		Uploaded:   torrent.uploaded,
-		Downloaded: torrent.downloaded,
-		Left:       torrent.BytesLeft(),
+		Uploaded:   stats.uploaded,
+		Downloaded: stats.downloaded,
+		Left:       stats.left,
 		InfoHash:   torrent.Meta.InfoHash,
 		PeerID:     c.peerID,
 		Compact:    true,
@@ -220,7 +233,7 @@ func (c *Client) announce(ctx context.Context, torrent *Torrent, event tracker.A
 }
 
 func (c *Client) connect(ctx context.Context, torrent *Torrent, candidate tracker.Peer) error {
-	conn, err := DialPeer(ctx, candidate)
+	conn, err := dialPeer(ctx, candidate)
 	if err != nil {
 		return err
 	}
@@ -239,8 +252,8 @@ func (c *Client) connect(ctx context.Context, torrent *Torrent, candidate tracke
 		return err
 	}
 
-	peer := CreatePeer(conn, handshake)
-	if !torrent.registerPeer(ctx, peer) {
+	peer := newPeer(conn, handshake)
+	if !torrent.attachPeer(ctx, peer) {
 		_ = conn.Close()
 	}
 	return nil
