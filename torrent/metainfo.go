@@ -2,9 +2,11 @@ package torrent
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 )
 
 type PieceHash [20]byte
@@ -27,14 +29,28 @@ type MetaInfo struct {
 	InfoHash InfoHash
 }
 
-func ReadMetaInfo(f *os.File) (MetaInfo, error) {
+const maxMetaInfoSize = 16 << 20
 
-	bReader := BReader{r: bufio.NewReader(f)}
+func ReadMetaInfo(r io.Reader) (MetaInfo, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxMetaInfoSize+1))
+	if err != nil {
+		return MetaInfo{}, fmt.Errorf("read metainfo: %w", err)
+	}
+	if len(data) > maxMetaInfoSize {
+		return MetaInfo{}, fmt.Errorf("%w: metainfo exceeds %d bytes", invalidTorrentFile, maxMetaInfoSize)
+	}
 
-	bCoding, err := bReader.decodeBDict()
+	bReader := BReader{r: bufio.NewReader(bytes.NewReader(data))}
+
+	bCoding, err := bReader.decode()
 
 	if err != nil {
 		return MetaInfo{}, err
+	}
+	if _, err := bReader.r.Peek(1); err == nil {
+		return MetaInfo{}, fmt.Errorf("%w: trailing data", invalidTorrentFile)
+	} else if !errors.Is(err, io.EOF) {
+		return MetaInfo{}, fmt.Errorf("check metainfo ending: %w", err)
 	}
 
 	metaDict, ok := bCoding.Dict()
@@ -43,46 +59,31 @@ func ReadMetaInfo(f *os.File) (MetaInfo, error) {
 		return MetaInfo{}, fmt.Errorf("invalid encoding")
 	}
 
-	announce := metaDict["announce"]
+	announce, ok := metaDict.String("announce")
+	if !ok || announce == "" {
+		return MetaInfo{}, fmt.Errorf("%w: announce must be a non-empty string", invalidTorrentFile)
+	}
 
-	iMap := metaDict["info"]
+	infoValue, ok := metaDict["info"]
+	if !ok {
+		return MetaInfo{}, fmt.Errorf("%w: info dictionary is missing", invalidTorrentFile)
+	}
 
-	mInfo, err := ParseInfo(iMap)
+	mInfo, err := ParseInfo(infoValue)
 
 	if err != nil {
 		return MetaInfo{}, err
 	}
-	/*
-		if pLen, ok := infoDict["piece length"]; ok {
-			pLenInt, ok := pLen.Int()
-			if ok {
-				mInfoDict.PieceLength = pLenInt
-			}
-		}
 
-		if pieces, ok := infoDict["pieces"]; ok {
-			piecesStr, ok := pieces.String()
-			if ok {
-				for len(piecesStr) >= len(PieceHash{}) {
-					var hash PieceHash
-					copy(hash[:], piecesStr[:len(hash)])
-					mInfoDict.PieceHashes = append(mInfoDict.PieceHashes, hash)
-					piecesStr = piecesStr[len(hash):]
-				}
-			}
-		}
-
-		if fLen, ok := infoDict["length"]; ok {
-			mInfoDict.Length, _ = fLen.Int()
-		}
-
-		if name, ok := infoDict["name"]; ok {
-			mInfoDict.Name, _ = name.String()
-		}*/
+	var encodedInfo bytes.Buffer
+	if err := writeBencoding(&encodedInfo, infoValue); err != nil {
+		return MetaInfo{}, fmt.Errorf("encode info dictionary: %w", err)
+	}
 
 	return MetaInfo{
-		Announce: announce.str,
+		Announce: announce,
 		Info:     mInfo,
+		InfoHash: InfoHash(sha1.Sum(encodedInfo.Bytes())),
 	}, nil
 }
 
@@ -95,29 +96,56 @@ func ParseInfo(info Bencoding) (Info, error) {
 		return Info{}, fmt.Errorf("info must be a bencoding dictionary")
 	}
 
-	pLen, ok := dict["piece length"]
-
-	if !ok {
-		return Info{}, invalidTorrentFile
+	if _, multiFile := dict["files"]; multiFile {
+		return Info{}, fmt.Errorf("%w: multi-file torrents are not supported", invalidTorrentFile)
 	}
 
-	piecesConcat := dict["peices"].str
+	pieceLength, ok := dict.Int("piece length")
+	if !ok || pieceLength <= 0 {
+		return Info{}, fmt.Errorf("%w: piece length must be a positive integer", invalidTorrentFile)
+	}
+
+	piecesConcat, ok := dict.String("pieces")
+	if !ok || len(piecesConcat)%len(PieceHash{}) != 0 {
+		return Info{}, fmt.Errorf("%w: pieces must be a string containing 20-byte hashes", invalidTorrentFile)
+	}
 
 	pieces := make([]PieceHash, 0)
 
-	for i := 0; i < len(pieces); i += 20 {
+	for i := 0; i < len(piecesConcat); i += len(PieceHash{}) {
 		var hash PieceHash
-		iPiece := piecesConcat[i : i+20]
+		iPiece := piecesConcat[i : i+len(hash)]
 		copy(hash[:], iPiece[:])
 		pieces = append(pieces, hash)
 	}
 
-	len := dict["length"].integer
+	length, ok := dict.Int("length")
+	if !ok || length < 0 {
+		return Info{}, fmt.Errorf("%w: length must be a non-negative integer", invalidTorrentFile)
+	}
+
+	name, ok := dict.String("name")
+	if !ok || name == "" {
+		return Info{}, fmt.Errorf("%w: name must be a non-empty string", invalidTorrentFile)
+	}
+
+	expectedPieces := int64(0)
+	if length > 0 {
+		expectedPieces = (length-1)/pieceLength + 1
+	}
+	if int64(len(pieces)) != expectedPieces {
+		return Info{}, fmt.Errorf(
+			"%w: found %d piece hashes, expected %d",
+			invalidTorrentFile,
+			len(pieces),
+			expectedPieces,
+		)
+	}
 
 	return Info{
-		PieceLength: pLen.integer,
-		Name:        dict["name"].str,
+		PieceLength: pieceLength,
+		Name:        name,
 		PieceHashes: pieces,
-		Length:      len,
+		Length:      length,
 	}, nil
 }

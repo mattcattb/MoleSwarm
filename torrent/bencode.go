@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 )
 
@@ -80,10 +81,12 @@ func (b *Bencoding) List() ([]Bencoding, bool) {
 }
 
 type BReader struct {
-	r *bufio.Reader
+	r     *bufio.Reader
+	depth int
 }
 
-// using a reader vs a...
+const maxBencodedStringLength = 16 << 20
+const maxBencodingDepth = 100
 
 func (r *BReader) decodeBString() (Bencoding, error) {
 	lengthBytes, err := r.r.ReadSlice(':')
@@ -93,13 +96,31 @@ func (r *BReader) decodeBString() (Bencoding, error) {
 	}
 
 	lengthBytes = lengthBytes[:len(lengthBytes)-1]
+	if len(lengthBytes) == 0 {
+		return Bencoding{}, fmt.Errorf("bencoded string length is empty")
+	}
+	if len(lengthBytes) > 1 && lengthBytes[0] == '0' {
+		return Bencoding{}, fmt.Errorf("bencoded string length has a leading zero")
+	}
+	for _, digit := range lengthBytes {
+		if digit < '0' || digit > '9' {
+			return Bencoding{}, fmt.Errorf("bencoded string length contains a non-digit")
+		}
+	}
 
-	bStrBytes, err := strconv.ParseInt(string(lengthBytes), 10, 64)
+	bStrBytes, err := strconv.ParseUint(string(lengthBytes), 10, 64)
 	if err != nil {
 		return Bencoding{}, err
 	}
+	if bStrBytes > maxBencodedStringLength {
+		return Bencoding{}, fmt.Errorf(
+			"bencoded string length %d exceeds limit %d",
+			bStrBytes,
+			maxBencodedStringLength,
+		)
+	}
 
-	strBuffer := make([]byte, bStrBytes)
+	strBuffer := make([]byte, int(bStrBytes))
 
 	if _, err = io.ReadFull(r.r, strBuffer); err != nil {
 		return Bencoding{}, err
@@ -118,12 +139,34 @@ func (r *BReader) decodeBInteger() (Bencoding, error) {
 		return Bencoding{}, fmt.Errorf("invalid integer prefix")
 	}
 
-	line, err := r.r.ReadString('e')
+	line, err := r.r.ReadSlice('e')
 
 	if err != nil {
 		return Bencoding{}, err
 	}
 	line = line[:len(line)-1]
+	if len(line) == 0 {
+		return Bencoding{}, fmt.Errorf("bencoded integer is empty")
+	}
+
+	digits := line
+	if line[0] == '-' {
+		digits = line[1:]
+		if len(digits) == 0 {
+			return Bencoding{}, fmt.Errorf("bencoded integer has no digits")
+		}
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		return Bencoding{}, fmt.Errorf("bencoded integer has a leading zero")
+	}
+	if line[0] == '-' && digits[0] == '0' {
+		return Bencoding{}, fmt.Errorf("bencoded integer cannot be negative zero")
+	}
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return Bencoding{}, fmt.Errorf("bencoded integer contains a non-digit")
+		}
+	}
 
 	value, err := strconv.ParseInt(
 		string(line),
@@ -139,6 +182,14 @@ func (r *BReader) decodeBInteger() (Bencoding, error) {
 }
 
 func (r *BReader) decode() (Bencoding, error) {
+	if r.depth >= maxBencodingDepth {
+		return Bencoding{}, fmt.Errorf("bencoding nesting exceeds limit %d", maxBencodingDepth)
+	}
+	r.depth++
+	defer func() {
+		r.depth--
+	}()
+
 	prefix, err := r.r.Peek(1)
 	if err != nil {
 		return Bencoding{}, err
@@ -167,6 +218,8 @@ func (r *BReader) decodeBDict() (Bencoding, error) {
 	}
 
 	bEncodingMap := map[string]Bencoding{}
+	var previousKey string
+	hasPreviousKey := false
 
 	for {
 		next, err := r.r.Peek(1)
@@ -186,6 +239,12 @@ func (r *BReader) decodeBDict() (Bencoding, error) {
 		if err != nil {
 			return Bencoding{}, err
 		}
+		if hasPreviousKey && key.str <= previousKey {
+			return Bencoding{}, fmt.Errorf("dictionary keys must be unique and sorted")
+		}
+		previousKey = key.str
+		hasPreviousKey = true
+
 		val, err := r.decode()
 
 		if err != nil {
@@ -269,11 +328,73 @@ func (b BencodingDict) Dict(key string) (BencodingDict, bool) {
 }
 
 func (b BencodingDict) List(key string) ([]Bencoding, bool) {
-	val, ok := b["key"]
+	val, ok := b[key]
 
 	if !ok {
 		return []Bencoding{}, false
 	}
 
 	return val.List()
+}
+
+func writeBencoding(w io.Writer, value Bencoding) error {
+	switch value.kind {
+	case StringKind:
+		if err := writeAll(w, []byte(strconv.Itoa(len(value.str))+":")); err != nil {
+			return err
+		}
+		return writeAll(w, []byte(value.str))
+
+	case IntegerKind:
+		return writeAll(w, []byte("i"+strconv.FormatInt(value.integer, 10)+"e"))
+
+	case ListKind:
+		if err := writeAll(w, []byte{'l'}); err != nil {
+			return err
+		}
+		for _, item := range value.array {
+			if err := writeBencoding(w, item); err != nil {
+				return err
+			}
+		}
+		return writeAll(w, []byte{'e'})
+
+	case DictKind:
+		if err := writeAll(w, []byte{'d'}); err != nil {
+			return err
+		}
+
+		keys := make([]string, 0, len(value.dict))
+		for key := range value.dict {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for _, key := range keys {
+			if err := writeBencoding(w, StringBencoding(key)); err != nil {
+				return err
+			}
+			if err := writeBencoding(w, value.dict[key]); err != nil {
+				return err
+			}
+		}
+		return writeAll(w, []byte{'e'})
+
+	default:
+		return fmt.Errorf("unknown bencoding kind %q", value.kind)
+	}
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }

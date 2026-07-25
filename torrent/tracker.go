@@ -2,9 +2,13 @@ package torrent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -25,10 +29,10 @@ type TrackerAnnounceRequest struct {
 	InfoHash InfoHash
 	PeerID   PeerID
 
-	port       uint16
-	uploaded   uint64
-	downloaded uint64
-	left       uint64
+	Port       uint16
+	Uploaded   uint64
+	Downloaded uint64
+	Left       uint64
 	Compact    bool
 	Event      AnnounceEvent
 }
@@ -36,7 +40,7 @@ type TrackerAnnounceRequest struct {
 type PeerRecord struct {
 	PeerID PeerID
 	IP     netip.Addr
-	port   uint16
+	Port   uint16
 }
 
 type TrackerResponse struct {
@@ -45,24 +49,47 @@ type TrackerResponse struct {
 }
 
 func Announce(ctx context.Context, announceURL string, request TrackerAnnounceRequest) (TrackerResponse, error) {
-
-	formattedUrl, err := encodeAnnounceRequest(announceURL, request)
+	formattedURL, err := encodeAnnounceRequest(announceURL, request)
 
 	if err != nil {
 		return TrackerResponse{}, err
 	}
 
-	resp, err := http.Get(formattedUrl.String())
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, formattedURL.String(), nil)
+	if err != nil {
+		return TrackerResponse{}, fmt.Errorf("build announce HTTP request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(httpRequest)
 
 	if err != nil {
 		return TrackerResponse{}, fmt.Errorf("announce HTTP request: %w", err)
 	}
 
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return TrackerResponse{}, fmt.Errorf("announce HTTP status: %s", resp.Status)
+	}
 
-	bReader := BReader{r: bufio.NewReader(resp.Body)}
+	const maxTrackerResponseSize = 4 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTrackerResponseSize+1))
+	if err != nil {
+		return TrackerResponse{}, fmt.Errorf("read tracker response: %w", err)
+	}
+	if len(body) > maxTrackerResponseSize {
+		return TrackerResponse{}, fmt.Errorf("tracker response exceeds %d bytes", maxTrackerResponseSize)
+	}
+	bReader := BReader{r: bufio.NewReader(bytes.NewReader(body))}
 
 	bodyBencoding, err := bReader.decode()
+	if err != nil {
+		return TrackerResponse{}, fmt.Errorf("decode tracker response: %w", err)
+	}
+	if _, err := bReader.r.Peek(1); err == nil {
+		return TrackerResponse{}, fmt.Errorf("decode tracker response: trailing data")
+	} else if !errors.Is(err, io.EOF) {
+		return TrackerResponse{}, fmt.Errorf("decode tracker response ending: %w", err)
+	}
 
 	trackerResp, err := decodeTrackerResponse(bodyBencoding)
 
@@ -74,25 +101,34 @@ func Announce(ctx context.Context, announceURL string, request TrackerAnnounceRe
 
 }
 
-func encodeAnnounceRequest(announceUrl string, request TrackerAnnounceRequest) (url.URL, error) {
-	baseUrl, err := url.Parse(announceUrl)
+func encodeAnnounceRequest(announceURL string, request TrackerAnnounceRequest) (url.URL, error) {
+	baseURL, err := url.Parse(announceURL)
 	if err != nil {
 		return url.URL{}, err
 	}
 
-	params := url.Values{}
+	params := baseURL.Query()
 
-	params.Add("info_hash", string(request.InfoHash[:]))
-	params.Add("peer_id", string(request.PeerID[:]))
-	params.Add("port", strconv.FormatUint(uint64(request.port), 10))
-	params.Add("uploaded", strconv.Itoa(int(request.uploaded)))
-	params.Add("downloaded", strconv.Itoa(int(request.downloaded)))
-	params.Add("left", strconv.Itoa(int(request.left)))
-	params.Add("event", string(request.Event))
+	params.Set("info_hash", string(request.InfoHash[:]))
+	params.Set("peer_id", string(request.PeerID[:]))
+	params.Set("port", strconv.FormatUint(uint64(request.Port), 10))
+	params.Set("uploaded", strconv.FormatUint(request.Uploaded, 10))
+	params.Set("downloaded", strconv.FormatUint(request.Downloaded, 10))
+	params.Set("left", strconv.FormatUint(request.Left, 10))
+	if request.Compact {
+		params.Set("compact", "1")
+	} else {
+		params.Set("compact", "0")
+	}
+	if request.Event != "" {
+		params.Set("event", string(request.Event))
+	} else {
+		params.Del("event")
+	}
 
-	baseUrl.RawQuery = params.Encode()
+	baseURL.RawQuery = params.Encode()
 
-	return *baseUrl, nil
+	return *baseURL, nil
 }
 
 var InvalidAnounceRequest = errors.New("invalid response request")
@@ -177,10 +213,10 @@ func decodeAnnounceRequest(req *http.Request) (TrackerAnnounceRequest, error) {
 	event := qParams.Get("event")
 
 	return TrackerAnnounceRequest{
-		port:       port,
-		uploaded:   uploaded,
-		downloaded: downloaded,
-		left:       left,
+		Port:       port,
+		Uploaded:   uploaded,
+		Downloaded: downloaded,
+		Left:       left,
 		InfoHash:   infoHash,
 		Event:      AnnounceEvent(event),
 		PeerID:     peerId,
@@ -205,30 +241,50 @@ func decodeTrackerResponse(value Bencoding) (TrackerResponse, error) {
 		// interval does not exist
 		return TrackerResponse{}, fmt.Errorf("interval not present in response dict")
 	}
+	if intervalInt < 0 || intervalInt > math.MaxInt64/int64(time.Second) {
+		return TrackerResponse{}, fmt.Errorf("tracker interval %d is invalid", intervalInt)
+	}
 
 	// trackerIdB, ok := body.String("tracker id")
 	// string client should send back
 
-	peersValList, ok := body.List("peers")
-
+	peersValue, ok := body["peers"]
 	if !ok {
-		return TrackerResponse{}, fmt.Errorf("peers key not a list")
+		return TrackerResponse{}, fmt.Errorf("peers key is missing")
 	}
 
 	peersList := make([]PeerRecord, 0)
+	if peersValList, ok := peersValue.List(); ok {
+		for _, bval := range peersValList {
+			peerRecord, err := parsePeerRecord(bval)
 
-	for _, bval := range peersValList {
-		peerRecord, err := parsePeerRecord(bval)
+			if err != nil {
+				return TrackerResponse{}, err
+			}
 
-		if err != nil {
-			return TrackerResponse{}, err
+			peersList = append(peersList, peerRecord)
+		}
+	} else if compactPeers, ok := peersValue.String(); ok {
+		if len(compactPeers)%6 != 0 {
+			return TrackerResponse{}, fmt.Errorf("compact peers length %d is not divisible by 6", len(compactPeers))
 		}
 
-		peersList = append(peersList, peerRecord)
+		for offset := 0; offset < len(compactPeers); offset += 6 {
+			var rawIP [4]byte
+			copy(rawIP[:], compactPeers[offset:offset+4])
+			ip := netip.AddrFrom4(rawIP)
+			port := binary.BigEndian.Uint16([]byte(compactPeers[offset+4 : offset+6]))
+			if port == 0 {
+				return TrackerResponse{}, fmt.Errorf("compact peer has invalid port 0")
+			}
+			peersList = append(peersList, PeerRecord{IP: ip, Port: port})
+		}
+	} else {
+		return TrackerResponse{}, fmt.Errorf("peers must be a list or compact string")
 	}
 
 	return TrackerResponse{
-		Interval: time.Duration(intervalInt),
+		Interval: time.Duration(intervalInt) * time.Second,
 		Peers:    peersList,
 	}, nil
 
@@ -246,34 +302,32 @@ func parsePeerRecord(val Bencoding) (PeerRecord, error) {
 
 	pId, ok := bDict.String("peer id")
 
-	if !ok {
+	if !ok || len(pId) != len(PeerID{}) {
 		return PeerRecord{}, InvalidBencodingFormat
 	}
 
-	// pIp, ok := bDict.String("ip")
-
+	pIP, ok := bDict.String("ip")
 	if !ok {
 		return PeerRecord{}, InvalidBencodingFormat
 	}
-	// pPort, ok := bDict.Int("port")
-	if !ok {
+	ip, err := netip.ParseAddr(pIP)
+	if err != nil {
+		return PeerRecord{}, InvalidBencodingFormat
+	}
+
+	pPort, ok := bDict.Int("port")
+	if !ok || pPort <= 0 || pPort > math.MaxUint16 {
 		return PeerRecord{}, InvalidBencodingFormat
 	}
 
 	var peerId PeerID
 	copy(peerId[:], []byte(pId))
 
-	return PeerRecord{}, nil
-
-	/*
-		var ip netip.Addr
-		copy(ip, pIp)
-
-		return PeerRecord{
-			port:   uint16(pPort),
-			PeerID: peerId,
-			IP:     netip.AddrFrom16(pIp[16]),
-		}, nil */
+	return PeerRecord{
+		Port:   uint16(pPort),
+		PeerID: peerId,
+		IP:     ip,
+	}, nil
 }
 
 func encodeTrackerResponse(resp TrackerResponse) (Bencoding, error) {
@@ -286,7 +340,7 @@ func encodeTrackerResponse(resp TrackerResponse) (Bencoding, error) {
 
 		iDict["peer id"] = StringBencoding(string(pr.PeerID[:]))
 		iDict["ip"] = StringBencoding(pr.IP.String())
-		iDict["port"] = IntegerBencoding(int64(pr.port))
+		iDict["port"] = IntegerBencoding(int64(pr.Port))
 
 		peerList = append(peerList, DictBencoding(iDict))
 	}

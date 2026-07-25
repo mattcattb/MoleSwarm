@@ -24,7 +24,7 @@ type Peer struct {
 
 func DialPeer(ctx context.Context, peerRecord PeerRecord) (net.Conn, error) {
 	dialer := net.Dialer{}
-	return dialer.DialContext(ctx, "tcp", netip.AddrPortFrom(peerRecord.IP, peerRecord.port).String())
+	return dialer.DialContext(ctx, "tcp", netip.AddrPortFrom(peerRecord.IP, peerRecord.Port).String())
 }
 
 func CompleteHandshake(conn net.Conn, info MetaInfo, peerId PeerID) (*Peer, error) {
