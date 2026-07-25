@@ -1,7 +1,8 @@
-package torrent
+package protocol
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -80,15 +81,33 @@ func (b *Bencoding) List() ([]Bencoding, bool) {
 	return b.array, true
 }
 
-type BReader struct {
+type decoder struct {
 	r     *bufio.Reader
 	depth int
+}
+
+func Decode(r io.Reader) (Bencoding, error) {
+	decoder := decoder{r: bufio.NewReader(r)}
+	value, err := decoder.decode()
+	if err != nil {
+		return Bencoding{}, err
+	}
+	if _, err := decoder.r.Peek(1); err == nil {
+		return Bencoding{}, fmt.Errorf("trailing bencoded data")
+	} else if !errors.Is(err, io.EOF) {
+		return Bencoding{}, fmt.Errorf("check bencoded data ending: %w", err)
+	}
+	return value, nil
+}
+
+func Encode(w io.Writer, value Bencoding) error {
+	return writeBencoding(w, value)
 }
 
 const maxBencodedStringLength = 16 << 20
 const maxBencodingDepth = 100
 
-func (r *BReader) decodeBString() (Bencoding, error) {
+func (r *decoder) decodeBString() (Bencoding, error) {
 	lengthBytes, err := r.r.ReadSlice(':')
 
 	if err != nil {
@@ -130,7 +149,7 @@ func (r *BReader) decodeBString() (Bencoding, error) {
 
 }
 
-func (r *BReader) decodeBInteger() (Bencoding, error) {
+func (r *decoder) decodeBInteger() (Bencoding, error) {
 	prefix, err := r.r.ReadByte()
 	if err != nil {
 		return Bencoding{}, err
@@ -181,7 +200,7 @@ func (r *BReader) decodeBInteger() (Bencoding, error) {
 	return IntegerBencoding(int64(value)), nil
 }
 
-func (r *BReader) decode() (Bencoding, error) {
+func (r *decoder) decode() (Bencoding, error) {
 	if r.depth >= maxBencodingDepth {
 		return Bencoding{}, fmt.Errorf("bencoding nesting exceeds limit %d", maxBencodingDepth)
 	}
@@ -207,7 +226,7 @@ func (r *BReader) decode() (Bencoding, error) {
 	}
 }
 
-func (r *BReader) decodeBDict() (Bencoding, error) {
+func (r *decoder) decodeBDict() (Bencoding, error) {
 	prefix, err := r.r.ReadByte()
 	if err != nil {
 		return Bencoding{}, err
@@ -258,7 +277,7 @@ func (r *BReader) decodeBDict() (Bencoding, error) {
 	return Bencoding{kind: DictKind, dict: bEncodingMap}, nil
 }
 
-func (r *BReader) decodeBList() (Bencoding, error) {
+func (r *decoder) decodeBList() (Bencoding, error) {
 	prefix, err := r.r.ReadByte()
 
 	if err != nil {

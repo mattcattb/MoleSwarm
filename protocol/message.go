@@ -1,75 +1,15 @@
-package torrent
+package protocol
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 )
 
-func ReadPeerHandshake(r *bufio.Reader) (PeerHandshakeMessage, error) {
-
-	pStrLen, err := r.ReadByte()
-	if err != nil {
-		return PeerHandshakeMessage{}, err
-	}
-
-	peerStringLength := uint8(pStrLen)
-
-	pStr := make([]byte, peerStringLength)
-
-	_, err = r.Read(pStr)
-
-	if err != nil {
-		return PeerHandshakeMessage{}, err
-	}
-
-	var reserved [8]byte
-	if _, err := io.ReadFull(r, reserved[:]); err != nil {
-		return PeerHandshakeMessage{}, err
-	}
-
-	var infoHash InfoHash
-
-	if _, err := io.ReadFull(r, infoHash[:]); err != nil {
-		return PeerHandshakeMessage{}, err
-	}
-
-	var peerId PeerID
-
-	if _, err := io.ReadFull(r, peerId[:]); err != nil {
-		return PeerHandshakeMessage{}, err
-	}
-
-	return PeerHandshakeMessage{
-		pstr:     string(pStr),
-		InfoHash: infoHash,
-		PeerID:   peerId,
-		Reserved: reserved,
-	}, nil
-}
-
-func WritePeerHandshake(w *bufio.Writer, message PeerHandshakeMessage) error {
-
-	buffer := make([]byte, 0)
-	buffer = append(buffer, byte(len(message.pstr)))
-	buffer = append(buffer, message.pstr...)
-
-	buffer = append(buffer, message.Reserved[:]...)
-	buffer = append(buffer, message.InfoHash[:]...)
-	buffer = append(buffer, message.PeerID[:]...)
-
-	if _, err := w.Write(buffer); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 var maxPeerMessageSize = uint32(500000)
 
-func ReadMessage(r io.Reader) (pm PeerMessage, err error) {
+func ReadMessage(r io.Reader) (pm Message, err error) {
 	var lengthBytes [4]byte
 
 	if _, err := io.ReadFull(r, lengthBytes[:]); err != nil {
@@ -96,31 +36,44 @@ func ReadMessage(r io.Reader) (pm PeerMessage, err error) {
 
 var invalidPayloadLength = errors.New("invalid payload length")
 
-func decodeBody(body []byte) (PeerMessage, error) {
+var fixedPayloadLengths = map[MessageID]int{
+	ChokeID:         0,
+	UnchokeID:       0,
+	InterestedID:    0,
+	NotInterestedID: 0,
+	HaveID:          4,
+	RequestID:       12,
+	CancelID:        12,
+}
+
+func decodeBody(body []byte) (Message, error) {
 	if len(body) == 0 {
 		return nil, errors.New("peer message len")
 	}
 	id := MessageID(body[0])
 	payload := body[1:]
+	if expected, fixed := fixedPayloadLengths[id]; fixed && len(payload) != expected {
+		return nil, fmt.Errorf(
+			"%w for message %d: got %d bytes, want %d",
+			invalidPayloadLength,
+			id,
+			len(payload),
+			expected,
+		)
+	}
 
 	switch id {
-	case ChokeID:
-		if len(payload) != 0 {
-			return nil, invalidPayloadLength
-		}
+	case InterestedID:
+		return Interested{}, nil
 
+	case NotInterestedID:
+		return NotInterested{}, nil
+	case ChokeID:
 		return Choke{}, nil
 
 	case UnchokeID:
-		if len(payload) != 0 {
-			return nil, invalidPayloadLength
-		}
-
 		return Unchoke{}, nil
 	case HaveID:
-		if len(payload) != 4 {
-			return nil, invalidPayloadLength
-		}
 		return Have{PieceIndex: binary.BigEndian.Uint32(payload)}, nil
 	case RequestID:
 		block, err := decodeBlockRequest(payload)
@@ -147,7 +100,7 @@ func decodeBody(body []byte) (PeerMessage, error) {
 	return nil, fmt.Errorf("unknown MessageID")
 }
 
-func decodePiece(payload []byte) (PeerMessage, error) {
+func decodePiece(payload []byte) (Message, error) {
 	if len(payload) < 8 {
 		return nil, fmt.Errorf(
 			"piece payload length is %d; expected at least 8",
@@ -173,28 +126,7 @@ func decodeBlockRequest(body []byte) (BlockRequest, error) {
 	return BlockRequest{PieceIndex: pieceIndex, Begin: begin, Length: length}, nil
 }
 
-func readBlockRequest(r *bufio.Reader) (BlockRequest, error) {
-	buff := make([]byte, 4)
-	_, err := r.Read(buff)
-	if err != nil {
-		return BlockRequest{}, err
-	}
-	pIndex := binary.BigEndian.Uint32(buff)
-
-	beginBuf := make([]byte, 4)
-	if _, err := r.Read(beginBuf); err != nil {
-		return BlockRequest{}, err
-	}
-	lenBuff := make([]byte, 4)
-	if _, err := r.Read(lenBuff); err != nil {
-		return BlockRequest{}, err
-	}
-
-	return BlockRequest{PieceIndex: pIndex, Begin: binary.BigEndian.Uint32(beginBuf), Length: binary.BigEndian.Uint32(lenBuff)}, nil
-
-}
-
-func WriteMessage(w io.Writer, message PeerMessage) error {
+func WriteMessage(w io.Writer, message Message) error {
 
 	if _, ok := message.(KeepAlive); ok {
 		var KeepAlive [4]byte
@@ -206,26 +138,30 @@ func WriteMessage(w io.Writer, message PeerMessage) error {
 		return nil
 	}
 
-	buffer, err := encodeMessage(message)
+	body, err := encodeMessage(message)
 
 	if err != nil {
 		return err
 	}
 
-	n, err := w.Write(buffer)
+	frame := make([]byte, 4, 4+len(body))
+	binary.BigEndian.PutUint32(frame, uint32(len(body)))
+	frame = append(frame, body...)
+
+	n, err := w.Write(frame)
 
 	if err != nil {
 		return err
 	}
 
-	if n != len(buffer) {
-		return invalidPayloadLength
+	if n != len(frame) {
+		return io.ErrShortWrite
 	}
 
 	return nil
 }
 
-func encodeMessage(message PeerMessage) ([]byte, error) {
+func encodeMessage(message Message) ([]byte, error) {
 	switch message := message.(type) {
 	case Choke:
 		return []byte{byte(ChokeID)}, nil

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"testing"
+
+	"github.com/mattcattb/go-torrent/protocol"
 )
 
 func TestPieceSetWritesVerifiedPieceAndUpdatesLeft(t *testing.T) {
@@ -19,7 +21,7 @@ func TestPieceSetWritesVerifiedPieceAndUpdatesLeft(t *testing.T) {
 		t.Fatalf("initial bytes left = %d, want %d", got, want)
 	}
 
-	assembled, err := pieces.StoreBlock(BlockRequest{
+	assembled, err := pieces.StoreBlock(protocol.BlockRequest{
 		PieceIndex: 0,
 		Begin:      0,
 		Length:     blockSize,
@@ -31,7 +33,7 @@ func TestPieceSetWritesVerifiedPieceAndUpdatesLeft(t *testing.T) {
 		t.Fatal("first block assembled the piece")
 	}
 
-	assembled, err = pieces.StoreBlock(BlockRequest{
+	assembled, err = pieces.StoreBlock(protocol.BlockRequest{
 		PieceIndex: 0,
 		Begin:      blockSize,
 		Length:     9,
@@ -77,7 +79,7 @@ func TestPieceSetKeepsBytesLeftAfterHashMismatch(t *testing.T) {
 	}
 
 	wrong := bytes.Repeat([]byte("x"), len(expected))
-	assembled, err := pieces.StoreBlock(BlockRequest{
+	assembled, err := pieces.StoreBlock(protocol.BlockRequest{
 		PieceIndex: 0,
 		Begin:      0,
 		Length:     uint32(len(wrong)),
@@ -106,7 +108,7 @@ func TestPieceSetKeepsBytesLeftAfterHashMismatch(t *testing.T) {
 
 func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	data := []byte("a complete one-block piece")
-	torrent, err := NewTorrent(MetaInfo{Info: infoForTest(data)}, 0)
+	torrent, err := NewTorrent(protocol.MetaInfo{Info: infoForTest(data)})
 	if err != nil {
 		t.Fatalf("new torrent: %v", err)
 	}
@@ -119,14 +121,14 @@ func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	torrent.file = file
 
 	peer := &Peer{}
-	request := BlockRequest{
+	request := protocol.BlockRequest{
 		PieceIndex: 0,
 		Begin:      0,
 		Length:     uint32(len(data)),
 	}
 	torrent.pending[request] = peer
 
-	completed, err := torrent.receiveBlock(peer, Piece{
+	completed, err := torrent.receiveBlock(peer, protocol.Piece{
 		PieceIndex: 0,
 		Begin:      0,
 		Data:       data,
@@ -145,12 +147,12 @@ func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	}
 }
 
-func infoForTest(data []byte) Info {
-	hash := PieceHash(sha1.Sum(data))
-	return Info{
+func infoForTest(data []byte) protocol.Info {
+	hash := protocol.PieceHash(sha1.Sum(data))
+	return protocol.Info{
 		Name:        "fixture",
 		Length:      int64(len(data)),
 		PieceLength: int64(len(data)),
-		PieceHashes: []PieceHash{hash},
+		PieceHashes: []protocol.PieceHash{hash},
 	}
 }

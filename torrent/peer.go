@@ -1,11 +1,18 @@
 package torrent
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+
+	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/go-torrent/tracker"
 )
+
+const peerWriteQueueSize = 32
+
+var errPeerWriteQueueFull = errors.New("peer write queue is full")
 
 type PeerState struct {
 	AmChoking      bool
@@ -16,24 +23,24 @@ type PeerState struct {
 
 type Peer struct {
 	Conn     net.Conn
-	ID       PeerID
-	InfoHash InfoHash
+	ID       protocol.PeerID
+	InfoHash protocol.InfoHash
 	State    PeerState
 	Bitfield []byte
+	outgoing chan protocol.Message
 }
 
-func DialPeer(ctx context.Context, peerRecord PeerRecord) (net.Conn, error) {
+func DialPeer(ctx context.Context, peerRecord tracker.Peer) (net.Conn, error) {
 	dialer := net.Dialer{}
 	return dialer.DialContext(ctx, "tcp", netip.AddrPortFrom(peerRecord.IP, peerRecord.Port).String())
 }
 
-func CompleteHandshake(conn net.Conn, info MetaInfo, peerId PeerID) (*Peer, error) {
+func CompleteHandshake(conn net.Conn, info protocol.MetaInfo, peerID protocol.PeerID) (*Peer, error) {
 
-	buffWriter := bufio.NewWriter(conn)
-
-	if err := WritePeerHandshake(buffWriter, PeerHandshakeMessage{
+	if err := protocol.WriteHandshake(conn, protocol.Handshake{
 		InfoHash: info.InfoHash,
-		PeerID:   peerId,
+		PeerID:   peerID,
+		Protocol: protocol.PeerProtocol,
 	}); err != nil {
 		return nil, err
 	}
@@ -41,22 +48,27 @@ func CompleteHandshake(conn net.Conn, info MetaInfo, peerId PeerID) (*Peer, erro
 	// if connection dropped, does not have the info hash!
 	// uhhh maybe we await the other peer handshake? hmm
 
-	r := bufio.NewReader(conn)
-	handshakeMessage, err := ReadPeerHandshake(r)
+	handshakeMessage, err := protocol.ReadHandshake(conn)
 
 	if err != nil {
 		return nil, err
 	}
 
+	return CreatePeer(conn, handshakeMessage), nil
+}
+
+func CreatePeer(conn net.Conn, handshake protocol.Handshake) *Peer {
+
 	return &Peer{
 		Conn:     conn,
-		ID:       handshakeMessage.PeerID,
-		InfoHash: handshakeMessage.InfoHash,
+		ID:       handshake.PeerID,
+		InfoHash: handshake.InfoHash,
 		State: PeerState{
 			AmChoking:   true,
 			PeerChoking: true,
 		},
-	}, nil
+		outgoing: make(chan protocol.Message, peerWriteQueueSize),
+	}
 }
 
 func (p *Peer) HasPiece(index uint32) bool {
@@ -69,13 +81,16 @@ func (p *Peer) HasPiece(index uint32) bool {
 	return p.Bitfield[byteIndex]&mask != 0
 }
 
-func (p *Peer) sendMessage(msg PeerMessage) error {
-	return WriteMessage(p.Conn, msg)
+func (p *Peer) sendMessage(message protocol.Message) error {
+	if p.queue(message) {
+		return nil
+	}
+	return errPeerWriteQueueFull
 }
 
 type PeerEvent struct {
 	Peer    *Peer
-	Message PeerMessage
+	Message protocol.Message
 	Err     error
 }
 
@@ -83,7 +98,7 @@ func (p *Peer) readLoop(ctx context.Context, events chan<- PeerEvent) {
 
 	for {
 
-		msg, err := ReadMessage(p.Conn)
+		msg, err := protocol.ReadMessage(p.Conn)
 
 		event := PeerEvent{
 			Peer:    p,
@@ -104,6 +119,16 @@ func (p *Peer) readLoop(ctx context.Context, events chan<- PeerEvent) {
 	}
 }
 
+func (p *Peer) queue(message protocol.Message) bool {
+	select {
+	case p.outgoing <- message:
+		return true
+
+	default:
+		return false
+	}
+}
+
 func (p *Peer) setPieceHave(index uint32) {
 	byteIndex := index / 8
 	mask := byte(1 << (7 - index%8))
@@ -120,3 +145,24 @@ func (p *Peer) CanRequest() bool {
 
 }
 */
+
+func (p *Peer) writeLoop(ctx context.Context, events chan<- PeerEvent) {
+	for {
+
+		select {
+		case message := <-p.outgoing:
+			if err := protocol.WriteMessage(p.Conn, message); err != nil {
+				select {
+				case events <- PeerEvent{Peer: p, Err: err}:
+				case <-ctx.Done():
+
+				}
+				return
+			}
+
+		case <-ctx.Done():
+			return
+		}
+
+	}
+}

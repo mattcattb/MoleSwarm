@@ -1,4 +1,4 @@
-package torrent
+package tracker
 
 import (
 	"context"
@@ -8,12 +8,14 @@ import (
 	"net/netip"
 	"testing"
 	"time"
+
+	"github.com/mattcattb/go-torrent/protocol"
 )
 
 func TestAnnounceReturnsDictionaryPeers(t *testing.T) {
-	infoHash := InfoHash{1, 2, 3}
-	clientPeerID := PeerID{4, 5, 6}
-	trackedPeerID := PeerID{7, 8, 9}
+	infoHash := protocol.InfoHash{1, 2, 3}
+	clientPeerID := protocol.PeerID{4, 5, 6}
+	trackedPeerID := protocol.PeerID{7, 8, 9}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.Method, http.MethodGet; got != want {
@@ -58,7 +60,7 @@ func TestAnnounceReturnsDictionaryPeers(t *testing.T) {
 	}))
 	defer server.Close()
 
-	response, err := Announce(context.Background(), server.URL+"?passkey=secret&port=1", TrackerAnnounceRequest{
+	response, err := Announce(context.Background(), server.URL+"?passkey=secret&port=1", AnnounceRequest{
 		InfoHash:   infoHash,
 		PeerID:     clientPeerID,
 		Port:       6881,
@@ -103,7 +105,7 @@ func TestAnnounceReturnsCompactPeers(t *testing.T) {
 	}))
 	defer server.Close()
 
-	response, err := Announce(context.Background(), server.URL, TrackerAnnounceRequest{
+	response, err := Announce(context.Background(), server.URL, AnnounceRequest{
 		Compact: true,
 	})
 	if err != nil {
@@ -129,7 +131,7 @@ func TestAnnounceReturnsTrackerFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if _, err := Announce(context.Background(), server.URL, TrackerAnnounceRequest{}); err == nil {
+	if _, err := Announce(context.Background(), server.URL, AnnounceRequest{}); err == nil {
 		t.Fatal("announce succeeded for a tracker failure response")
 	}
 }
@@ -152,7 +154,7 @@ func TestAnnounceHonorsContextCancellation(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := Announce(ctx, server.URL, TrackerAnnounceRequest{})
+	_, err := Announce(ctx, server.URL, AnnounceRequest{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("announce error = %v, want context cancellation", err)
 	}

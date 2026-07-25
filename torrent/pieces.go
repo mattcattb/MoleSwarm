@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/mattcattb/go-torrent/protocol"
 )
 
 const blockSize uint32 = 16 * 1024
@@ -21,11 +23,11 @@ type PieceState struct {
 // PieceSet owns the local, verified view of a torrent's content. It does not
 // know which peers exist or which peer owns an outstanding request.
 type PieceSet struct {
-	info   Info
+	info   protocol.Info
 	states []PieceState
 }
 
-func NewPieceSet(info Info) (PieceSet, error) {
+func NewPieceSet(info protocol.Info) (PieceSet, error) {
 	if info.Length < 0 {
 		return PieceSet{}, fmt.Errorf("torrent length cannot be negative")
 	}
@@ -138,10 +140,10 @@ func (p *PieceSet) prepare(index uint32) error {
 
 func (p *PieceSet) nextMissingBlock(
 	index uint32,
-	isPending func(BlockRequest) bool,
-) (BlockRequest, bool, error) {
+	isPending func(protocol.BlockRequest) bool,
+) (protocol.BlockRequest, bool, error) {
 	if err := p.prepare(index); err != nil {
-		return BlockRequest{}, false, err
+		return protocol.BlockRequest{}, false, err
 	}
 
 	piece := &p.states[index]
@@ -152,18 +154,18 @@ func (p *PieceSet) nextMissingBlock(
 
 		request, err := p.blockRequest(index, uint32(blockIndex)*blockSize)
 		if err != nil {
-			return BlockRequest{}, false, err
+			return protocol.BlockRequest{}, false, err
 		}
 		if !isPending(request) {
 			return request, true, nil
 		}
 	}
 
-	return BlockRequest{}, false, nil
+	return protocol.BlockRequest{}, false, nil
 }
 
 func (p *PieceSet) StoreBlock(
-	request BlockRequest,
+	request protocol.BlockRequest,
 	data []byte,
 ) (bool, error) {
 	expected, err := p.blockRequest(request.PieceIndex, request.Begin)
@@ -204,7 +206,7 @@ func (p *PieceSet) VerifyAndWrite(index uint32, file *os.File) error {
 		return fmt.Errorf("piece %d is incomplete", index)
 	}
 
-	if PieceHash(sha1.Sum(piece.Data)) != p.info.PieceHashes[index] {
+	if protocol.PieceHash(sha1.Sum(piece.Data)) != p.info.PieceHashes[index] {
 		piece.Data = nil
 		piece.Received = nil
 		return fmt.Errorf("piece %d: %w", index, ErrPieceHashMismatch)
@@ -229,7 +231,7 @@ func (p *PieceSet) VerifyAndWrite(index uint32, file *os.File) error {
 	return nil
 }
 
-func (p *PieceSet) ReadBlock(request BlockRequest, file *os.File) ([]byte, error) {
+func (p *PieceSet) ReadBlock(request protocol.BlockRequest, file *os.File) ([]byte, error) {
 	if file == nil {
 		return nil, fmt.Errorf("torrent output file is not open")
 	}
@@ -262,22 +264,22 @@ func (p *PieceSet) ReadBlock(request BlockRequest, file *os.File) ([]byte, error
 	return data, nil
 }
 
-func (p *PieceSet) blockRequest(index, begin uint32) (BlockRequest, error) {
+func (p *PieceSet) blockRequest(index, begin uint32) (protocol.BlockRequest, error) {
 	if begin%blockSize != 0 {
-		return BlockRequest{}, fmt.Errorf("block offset %d is not aligned", begin)
+		return protocol.BlockRequest{}, fmt.Errorf("block offset %d is not aligned", begin)
 	}
 
 	pieceLength, err := p.PieceLength(index)
 	if err != nil {
-		return BlockRequest{}, err
+		return protocol.BlockRequest{}, err
 	}
 
 	length := requestLength(pieceLength, begin)
 	if length == 0 {
-		return BlockRequest{}, fmt.Errorf("block offset %d is outside piece %d", begin, index)
+		return protocol.BlockRequest{}, fmt.Errorf("block offset %d is outside piece %d", begin, index)
 	}
 
-	return BlockRequest{
+	return protocol.BlockRequest{
 		PieceIndex: index,
 		Begin:      begin,
 		Length:     length,
