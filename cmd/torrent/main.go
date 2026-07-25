@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mattcattb/MoleSwarm/torrent"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 func main() {
@@ -45,7 +45,7 @@ func run(args []string) error {
 
 		defer file.Close()
 
-		meta, err := torrent.ReadMetaInfo(file)
+		meta, err := protocol.ReadMetaInfo(file)
 
 		if err != nil {
 			return fmt.Errorf("error reading meta info: %q", err)

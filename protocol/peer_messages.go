@@ -1,11 +1,4 @@
-package torrent
-
-type PeerHandshakeMessage struct {
-	pstr     string
-	Reserved [8]byte
-	InfoHash InfoHash // 20 bytes
-	PeerID   PeerID   // 20 bytes
-}
+package protocol
 
 type MessageID uint8
 
@@ -21,7 +14,7 @@ const (
 	CancelID        MessageID = 8
 )
 
-type PeerMessage interface {
+type Message interface {
 	isMessage()
 }
 type KeepAlive struct{}

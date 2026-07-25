@@ -1,17 +1,12 @@
-package torrent
+package protocol
 
 import (
-	"bufio"
 	"strings"
 	"testing"
 )
 
 func TestDecodeString(t *testing.T) {
-	reader := BReader{
-		r: bufio.NewReader(strings.NewReader("4:spam")),
-	}
-
-	value, err := reader.decode()
+	value, err := Decode(strings.NewReader("4:spam"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,11 +18,7 @@ func TestDecodeString(t *testing.T) {
 }
 
 func TestDecodeInteger(t *testing.T) {
-	reader := BReader{
-		r: bufio.NewReader(strings.NewReader("i42e")),
-	}
-
-	value, err := reader.decode()
+	value, err := Decode(strings.NewReader("i42e"))
 	if err != nil {
 		t.Fatal(err)
 	}

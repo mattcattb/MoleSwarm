@@ -1,7 +1,6 @@
-package torrent
+package protocol
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"errors"
@@ -9,17 +8,12 @@ import (
 	"io"
 )
 
-type PieceHash [20]byte
-
 type Info struct {
 	Name        string
 	Length      int64       // file length in bytes
 	PieceLength int64       // length of each piece
 	PieceHashes []PieceHash // concatination of all 20 byte sha1 hash values
 }
-type InfoHash [20]byte
-
-type PeerID [20]byte
 
 // string whose length is a multiple of 20. It is to be subdivided into strings of length 20, each of which is the SHA1 hash of the piece at the corresponding index
 
@@ -40,17 +34,9 @@ func ReadMetaInfo(r io.Reader) (MetaInfo, error) {
 		return MetaInfo{}, fmt.Errorf("%w: metainfo exceeds %d bytes", invalidTorrentFile, maxMetaInfoSize)
 	}
 
-	bReader := BReader{r: bufio.NewReader(bytes.NewReader(data))}
-
-	bCoding, err := bReader.decode()
-
+	bCoding, err := Decode(bytes.NewReader(data))
 	if err != nil {
 		return MetaInfo{}, err
-	}
-	if _, err := bReader.r.Peek(1); err == nil {
-		return MetaInfo{}, fmt.Errorf("%w: trailing data", invalidTorrentFile)
-	} else if !errors.Is(err, io.EOF) {
-		return MetaInfo{}, fmt.Errorf("check metainfo ending: %w", err)
 	}
 
 	metaDict, ok := bCoding.Dict()
