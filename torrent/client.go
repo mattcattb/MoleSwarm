@@ -19,7 +19,18 @@ type Client struct {
 
 	mu         sync.RWMutex
 	torrents   map[protocol.InfoHash]*Torrent
+	runners    map[protocol.InfoHash]*torrentRunner
 	listenPort uint16
+}
+
+type torrentRunner struct {
+	commands chan runnerCommand
+	done     chan struct{}
+}
+
+type runnerCommand struct {
+	pause    bool
+	complete chan<- error
 }
 
 func NewClient() (*Client, error) {
@@ -31,11 +42,49 @@ func NewClient() (*Client, error) {
 	return &Client{
 		peerID:   peerID,
 		torrents: make(map[protocol.InfoHash]*Torrent),
+		runners:  make(map[protocol.InfoHash]*torrentRunner),
 	}, nil
 }
 
 func (c *Client) PeerID() protocol.PeerID {
 	return c.peerID
+}
+
+// PauseTorrent pauses one running torrent without stopping the client.
+func (c *Client) PauseTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
+	return c.setTorrentPaused(ctx, infoHash, true)
+}
+
+// ResumeTorrent resumes peer discovery and transfers for one paused torrent.
+func (c *Client) ResumeTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
+	return c.setTorrentPaused(ctx, infoHash, false)
+}
+
+func (c *Client) setTorrentPaused(ctx context.Context, infoHash protocol.InfoHash, pause bool) error {
+	c.mu.RLock()
+	runner, exists := c.runners[infoHash]
+	c.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("change torrent lifecycle: info hash %x is not running", infoHash)
+	}
+
+	complete := make(chan error, 1)
+	select {
+	case runner.commands <- runnerCommand{pause: pause, complete: complete}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-runner.done:
+		return fmt.Errorf("change torrent lifecycle: info hash %x stopped", infoHash)
+	}
+
+	select {
+	case err := <-complete:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-runner.done:
+		return fmt.Errorf("change torrent lifecycle: info hash %x stopped", infoHash)
+	}
 }
 
 // Listen creates the client listener and records its advertised port before
@@ -87,10 +136,30 @@ func (c *Client) RemoveTorrent(infoHash protocol.InfoHash) error {
 // RunTorrent announces one registered swarm, connects the returned peers, and
 // runs its transfer loop until the context is canceled.
 func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
-	torrent, exists := c.torrent(infoHash)
+	c.mu.Lock()
+	torrent, exists := c.torrents[infoHash]
 	if !exists {
+		c.mu.Unlock()
 		return fmt.Errorf("run torrent: info hash %x is not registered", infoHash)
 	}
+	if _, running := c.runners[infoHash]; running {
+		c.mu.Unlock()
+		return fmt.Errorf("run torrent: info hash %x is already running", infoHash)
+	}
+	runner := &torrentRunner{
+		commands: make(chan runnerCommand),
+		done:     make(chan struct{}),
+	}
+	c.runners[infoHash] = runner
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if current := c.runners[infoHash]; current == runner {
+			delete(c.runners, infoHash)
+		}
+		close(runner.done)
+		c.mu.Unlock()
+	}()
 
 	ready := make(chan error, 1)
 	runErr := make(chan error, 1)
@@ -113,18 +182,54 @@ func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) err
 	interval := trackerInterval(response.Interval)
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
+	var timerC <-chan time.Time = timer.C
+	stopTimer := func() {
+		if timerC == nil {
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timerC = nil
+	}
+	resetTimer := func(interval time.Duration) {
+		stopTimer()
+		timer.Reset(interval)
+		timerC = timer.C
+	}
+
 	for {
 		select {
 		case err := <-runErr:
 			return err
 
-		case <-timer.C:
+		case command := <-runner.commands:
+			changed, err := torrent.setPaused(ctx, command.pause)
+			if err == nil && changed {
+				if command.pause {
+					stopTimer()
+					_, _ = c.announce(ctx, torrent, tracker.StoppedEvent)
+				} else {
+					response, announceErr := c.announce(ctx, torrent, tracker.StartedEvent)
+					if announceErr == nil {
+						interval = trackerInterval(response.Interval)
+						c.connectAvailablePeers(ctx, torrent, response.Peers)
+					}
+					resetTimer(interval)
+				}
+			}
+			command.complete <- err
+
+		case <-timerC:
 			response, err := c.announce(ctx, torrent, "")
 			if err == nil {
 				interval = trackerInterval(response.Interval)
 				c.connectAvailablePeers(ctx, torrent, response.Peers)
 			}
-			timer.Reset(interval)
+			resetTimer(interval)
 		}
 	}
 }

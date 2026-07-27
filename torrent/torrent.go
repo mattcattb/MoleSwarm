@@ -25,6 +25,7 @@ type Torrent struct {
 
 	uploaded   uint64
 	downloaded uint64
+	paused     bool
 
 	lifecycleMu sync.Mutex
 	running     bool
@@ -33,14 +34,34 @@ type Torrent struct {
 	closeErr    error
 }
 
+// State describes the current transfer lifecycle of a running torrent.
+type State string
+
+const (
+	StateDownloading State = "downloading"
+	StateSeeding     State = "seeding"
+	StatePaused      State = "paused"
+)
+
+type torrentCommandKind uint8
+
+const (
+	snapshotCommand torrentCommandKind = iota
+	pauseCommand
+	resumeCommand
+)
+
 type torrentCommand struct {
+	kind     torrentCommandKind
 	snapshot chan<- Snapshot
+	changed  chan<- bool
 }
 
 // Snapshot is an immutable observation of one running torrent session. The
 // event loop constructs it so observers never read mutable peer, request, or
 // piece state directly.
 type Snapshot struct {
+	State           State          `json:"state"`
 	InfoHash        string         `json:"infoHash"`
 	Name            string         `json:"name"`
 	Tracker         string         `json:"tracker"`
@@ -141,7 +162,7 @@ func (t *Torrent) pendingCount(peer *peer) int {
 }
 
 func (t *Torrent) registerPeer(ctx context.Context, peer *peer) bool {
-	if peer == nil || len(t.peers) >= maxPeers {
+	if t.paused || peer == nil || len(t.peers) >= maxPeers {
 		return false
 	}
 	if _, exists := t.peers[peer.id]; exists {
@@ -221,7 +242,7 @@ func (t *Torrent) Snapshot(ctx context.Context) (Snapshot, error) {
 
 	response := make(chan Snapshot, 1)
 	select {
-	case t.commands <- torrentCommand{snapshot: response}:
+	case t.commands <- torrentCommand{kind: snapshotCommand, snapshot: response}:
 	case <-ctx.Done():
 		return Snapshot{}, ctx.Err()
 	case <-done:
@@ -235,6 +256,39 @@ func (t *Torrent) Snapshot(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, ctx.Err()
 	case <-done:
 		return Snapshot{}, fmt.Errorf("torrent stopped before reporting snapshot")
+	}
+}
+
+func (t *Torrent) setPaused(ctx context.Context, paused bool) (bool, error) {
+	t.lifecycleMu.Lock()
+	running := t.running
+	done := t.done
+	t.lifecycleMu.Unlock()
+	if !running {
+		return false, fmt.Errorf("torrent is not running")
+	}
+
+	changed := make(chan bool, 1)
+	kind := resumeCommand
+	if paused {
+		kind = pauseCommand
+	}
+
+	select {
+	case t.commands <- torrentCommand{kind: kind, changed: changed}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-done:
+		return false, fmt.Errorf("torrent stopped before changing lifecycle state")
+	}
+
+	select {
+	case lifecycleChanged := <-changed:
+		return lifecycleChanged, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-done:
+		return false, fmt.Errorf("torrent stopped before changing lifecycle state")
 	}
 }
 
@@ -279,6 +333,9 @@ func (t *Torrent) run(ctx context.Context, ready chan<- error) (err error) {
 				}
 				continue
 			}
+			if !t.hasPeer(event.peer) {
+				continue
+			}
 			if event.Err != nil {
 				t.removePeer(event.peer)
 				continue
@@ -289,7 +346,21 @@ func (t *Torrent) run(ctx context.Context, ready chan<- error) (err error) {
 			}
 
 		case command := <-t.commands:
-			command.snapshot <- t.snapshot()
+			switch command.kind {
+			case snapshotCommand:
+				command.snapshot <- t.snapshot()
+			case pauseCommand:
+				changed := !t.paused
+				t.paused = true
+				if changed {
+					t.closePeers()
+				}
+				command.changed <- changed
+			case resumeCommand:
+				changed := t.paused
+				t.paused = false
+				command.changed <- changed
+			}
 
 		case <-runCtx.Done():
 			return runCtx.Err()
@@ -321,6 +392,7 @@ func (t *Torrent) snapshot() Snapshot {
 	})
 
 	return Snapshot{
+		State:           t.state(),
 		InfoHash:        fmt.Sprintf("%x", t.Meta.InfoHash),
 		Name:            t.Meta.Info.Name,
 		Tracker:         t.Meta.Announce,
@@ -335,6 +407,24 @@ func (t *Torrent) snapshot() Snapshot {
 		PendingRequests: len(t.pending),
 		Peers:           peers,
 	}
+}
+
+func (t *Torrent) state() State {
+	if t.paused {
+		return StatePaused
+	}
+	if t.pieces.Complete() {
+		return StateSeeding
+	}
+	return StateDownloading
+}
+
+func (t *Torrent) hasPeer(peer *peer) bool {
+	if peer == nil {
+		return false
+	}
+	current, exists := t.peers[peer.id]
+	return exists && current == peer
 }
 
 func bitCount(bits []byte, pieceCount int) int {
