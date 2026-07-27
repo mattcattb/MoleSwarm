@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/mattcattb/go-torrent/protocol"
 	"github.com/mattcattb/go-torrent/tracker"
@@ -35,6 +36,18 @@ func NewClient() (*Client, error) {
 
 func (c *Client) PeerID() protocol.PeerID {
 	return c.peerID
+}
+
+// Listen creates the client listener and records its advertised port before
+// any torrent announces to a tracker.
+func (c *Client) Listen(address string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen for peers: %w", err)
+	}
+
+	c.setListenPort(listener)
+	return listener, nil
 }
 
 // AddTorrent attaches one swarm session to this process-level client.
@@ -95,13 +108,44 @@ func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) err
 		return err
 	}
 
-	for _, candidate := range response.Peers {
+	c.connectAvailablePeers(ctx, torrent, response.Peers)
+
+	interval := trackerInterval(response.Interval)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case err := <-runErr:
+			return err
+
+		case <-timer.C:
+			response, err := c.announce(ctx, torrent, "")
+			if err == nil {
+				interval = trackerInterval(response.Interval)
+				c.connectAvailablePeers(ctx, torrent, response.Peers)
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+func trackerInterval(interval time.Duration) time.Duration {
+	if interval < time.Second {
+		return 30 * time.Second
+	}
+	return interval
+}
+
+func (c *Client) connectAvailablePeers(ctx context.Context, torrent *Torrent, candidates []tracker.Peer) {
+	snapshot, err := torrent.Snapshot(ctx)
+	if err != nil || len(snapshot.Peers) != 0 {
+		return
+	}
+	for _, candidate := range candidates {
 		if err := c.connect(ctx, torrent, candidate); err != nil {
 			continue
 		}
 	}
-
-	return <-runErr
 }
 
 func (c *Client) Serve(ctx context.Context, listener net.Listener) error {
@@ -197,6 +241,7 @@ func (c *Client) routeIncomingPeer(ctx context.Context, conn net.Conn) {
 	}
 
 	peer := newPeer(conn, handshake)
+	peer.incoming = true
 	if !torrent.attachPeer(ctx, peer) {
 		_ = conn.Close()
 	}
@@ -215,16 +260,16 @@ func (c *Client) announce(ctx context.Context, torrent *Torrent, event tracker.A
 	port := c.listenPort
 	c.mu.RUnlock()
 
-	stats, err := torrent.stats(ctx)
+	snapshot, err := torrent.Snapshot(ctx)
 	if err != nil {
 		return tracker.AnnounceResponse{}, err
 	}
 
 	return tracker.Announce(ctx, torrent.Meta.Announce, tracker.AnnounceRequest{
 		Port:       port,
-		Uploaded:   stats.uploaded,
-		Downloaded: stats.downloaded,
-		Left:       stats.left,
+		Uploaded:   snapshot.UploadedBytes,
+		Downloaded: snapshot.DownloadedBytes,
+		Left:       snapshot.BytesLeft,
 		InfoHash:   torrent.Meta.InfoHash,
 		PeerID:     c.peerID,
 		Compact:    true,

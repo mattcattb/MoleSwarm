@@ -1,0 +1,8 @@
+Break My System tiny-file-v1
+
+This is a small, owned BitTorrent learning artifact.
+Its purpose is to make a complete, inspectable transfer visible:
+
+tracker announces -> peer discovery -> handshake -> piece request -> SHA-1 verification -> seeding
+
+The same exact bytes are used by the official seed and by learner clients.

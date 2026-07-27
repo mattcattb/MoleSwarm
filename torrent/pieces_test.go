@@ -106,6 +106,54 @@ func TestPieceSetKeepsBytesLeftAfterHashMismatch(t *testing.T) {
 	}
 }
 
+func TestPieceSetVerifyExistingMarksOnlyVerifiedDataComplete(t *testing.T) {
+	data := []byte("seed data must be verified before upload")
+	pieces, err := NewPieceSet(infoForTest(data))
+	if err != nil {
+		t.Fatalf("new piece set: %v", err)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "seed")
+	if err != nil {
+		t.Fatalf("create seed file: %v", err)
+	}
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
+		t.Fatalf("write seed data: %v", err)
+	}
+
+	if err := pieces.VerifyExisting(file); err != nil {
+		t.Fatalf("verify existing data: %v", err)
+	}
+	if !pieces.Complete() {
+		t.Fatal("verified seed data was not marked complete")
+	}
+}
+
+func TestPieceSetVerifyExistingRejectsHashMismatch(t *testing.T) {
+	pieces, err := NewPieceSet(infoForTest([]byte("expected seed data")))
+	if err != nil {
+		t.Fatalf("new piece set: %v", err)
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "seed")
+	if err != nil {
+		t.Fatalf("create seed file: %v", err)
+	}
+	defer file.Close()
+	if _, err := file.Write([]byte("wrong seed data!!!")); err != nil {
+		t.Fatalf("write seed data: %v", err)
+	}
+
+	err = pieces.VerifyExisting(file)
+	if !errors.Is(err, ErrPieceHashMismatch) {
+		t.Fatalf("verify existing error = %v, want hash mismatch", err)
+	}
+	if pieces.Complete() {
+		t.Fatal("hash-mismatched seed data was marked complete")
+	}
+}
+
 func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	data := []byte("a complete one-block piece")
 	torrent, err := NewTorrent(protocol.MetaInfo{Info: infoForTest(data)})
