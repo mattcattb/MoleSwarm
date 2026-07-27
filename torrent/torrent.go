@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 
 	"github.com/mattcattb/go-torrent/protocol"
@@ -33,13 +34,39 @@ type Torrent struct {
 }
 
 type torrentCommand struct {
-	stats chan<- torrentStats
+	snapshot chan<- Snapshot
 }
 
-type torrentStats struct {
-	uploaded   uint64
-	downloaded uint64
-	left       uint64
+// Snapshot is an immutable observation of one running torrent session. The
+// event loop constructs it so observers never read mutable peer, request, or
+// piece state directly.
+type Snapshot struct {
+	InfoHash        string         `json:"infoHash"`
+	Name            string         `json:"name"`
+	Tracker         string         `json:"tracker"`
+	TrackerID       string         `json:"trackerId,omitempty"`
+	TotalBytes      uint64         `json:"totalBytes"`
+	PieceLength     int64          `json:"pieceLength"`
+	TotalPieces     int            `json:"totalPieces"`
+	CompletePieces  int            `json:"completePieces"`
+	BytesLeft       uint64         `json:"bytesLeft"`
+	DownloadedBytes uint64         `json:"downloadedBytes"`
+	UploadedBytes   uint64         `json:"uploadedBytes"`
+	PendingRequests int            `json:"pendingRequests"`
+	Peers           []PeerSnapshot `json:"peers"`
+}
+
+// PeerSnapshot contains protocol state owned by the torrent event loop.
+type PeerSnapshot struct {
+	PeerID          string `json:"peerId"`
+	Address         string `json:"address"`
+	Incoming        bool   `json:"incoming"`
+	AmChoking       bool   `json:"amChoking"`
+	AmInterested    bool   `json:"amInterested"`
+	PeerChoking     bool   `json:"peerChoking"`
+	PeerInterested  bool   `json:"peerInterested"`
+	AvailablePieces int    `json:"availablePieces"`
+	PendingRequests int    `json:"pendingRequests"`
 }
 
 func NewTorrent(meta protocol.MetaInfo) (*Torrent, error) {
@@ -77,6 +104,27 @@ func OpenTorrent(meta protocol.MetaInfo, outputPath string) (*Torrent, error) {
 	return torrent, nil
 }
 
+// OpenSeed opens existing data for upload and verifies every piece before the
+// session is allowed to advertise it to peers.
+func OpenSeed(meta protocol.MetaInfo, dataPath string) (*Torrent, error) {
+	torrent, err := NewTorrent(meta)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := torrent.pieces.VerifyExisting(file); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	torrent.file = file
+	return torrent, nil
+}
+
 const maxPeers = int(5)
 
 func (t *Torrent) pendingCount(peer *peer) int {
@@ -100,10 +148,26 @@ func (t *Torrent) registerPeer(ctx context.Context, peer *peer) bool {
 		return false
 	}
 	t.peers[peer.id] = peer
+	if !peer.queue(protocol.Bitfield{Bits: t.bitfield()}) {
+		delete(t.peers, peer.id)
+		return false
+	}
 	go peer.readLoop(ctx, t.peerEvents)
 	go peer.writeLoop(ctx, t.peerEvents)
 
 	return true
+}
+
+func (t *Torrent) bitfield() []byte {
+	bits := make([]byte, (t.pieces.Count()+7)/8)
+	for index := 0; index < t.pieces.Count(); index++ {
+		if !t.pieces.IsComplete(uint32(index)) {
+			continue
+		}
+		byteIndex := index / 8
+		bits[byteIndex] |= 1 << (7 - uint(index)%8)
+	}
+	return bits
 }
 
 func (t *Torrent) Close() error {
@@ -146,31 +210,31 @@ func (t *Torrent) attachPeer(ctx context.Context, peer *peer) bool {
 	}
 }
 
-func (t *Torrent) stats(ctx context.Context) (torrentStats, error) {
+func (t *Torrent) Snapshot(ctx context.Context) (Snapshot, error) {
 	t.lifecycleMu.Lock()
 	running := t.running
 	done := t.done
 	t.lifecycleMu.Unlock()
 	if !running {
-		return torrentStats{}, fmt.Errorf("torrent is not running")
+		return Snapshot{}, fmt.Errorf("torrent is not running")
 	}
 
-	response := make(chan torrentStats, 1)
+	response := make(chan Snapshot, 1)
 	select {
-	case t.commands <- torrentCommand{stats: response}:
+	case t.commands <- torrentCommand{snapshot: response}:
 	case <-ctx.Done():
-		return torrentStats{}, ctx.Err()
+		return Snapshot{}, ctx.Err()
 	case <-done:
-		return torrentStats{}, fmt.Errorf("torrent stopped before reporting stats")
+		return Snapshot{}, fmt.Errorf("torrent stopped before reporting snapshot")
 	}
 
 	select {
-	case stats := <-response:
-		return stats, nil
+	case snapshot := <-response:
+		return snapshot, nil
 	case <-ctx.Done():
-		return torrentStats{}, ctx.Err()
+		return Snapshot{}, ctx.Err()
 	case <-done:
-		return torrentStats{}, fmt.Errorf("torrent stopped before reporting stats")
+		return Snapshot{}, fmt.Errorf("torrent stopped before reporting snapshot")
 	}
 }
 
@@ -225,16 +289,63 @@ func (t *Torrent) run(ctx context.Context, ready chan<- error) (err error) {
 			}
 
 		case command := <-t.commands:
-			command.stats <- torrentStats{
-				uploaded:   t.uploaded,
-				downloaded: t.downloaded,
-				left:       t.pieces.BytesLeft(),
-			}
+			command.snapshot <- t.snapshot()
 
 		case <-runCtx.Done():
 			return runCtx.Err()
 		}
 	}
+}
+
+func (t *Torrent) snapshot() Snapshot {
+	peers := make([]PeerSnapshot, 0, len(t.peers))
+	for _, peer := range t.peers {
+		address := ""
+		if peer.conn != nil && peer.conn.RemoteAddr() != nil {
+			address = peer.conn.RemoteAddr().String()
+		}
+		peers = append(peers, PeerSnapshot{
+			PeerID:          fmt.Sprintf("%x", peer.id),
+			Address:         address,
+			Incoming:        peer.incoming,
+			AmChoking:       peer.state.AmChoking,
+			AmInterested:    peer.state.AmInterested,
+			PeerChoking:     peer.state.PeerChoking,
+			PeerInterested:  peer.state.PeerInterested,
+			AvailablePieces: bitCount(peer.bitfield, t.pieces.Count()),
+			PendingRequests: t.pendingCount(peer),
+		})
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].PeerID < peers[j].PeerID
+	})
+
+	return Snapshot{
+		InfoHash:        fmt.Sprintf("%x", t.Meta.InfoHash),
+		Name:            t.Meta.Info.Name,
+		Tracker:         t.Meta.Announce,
+		TrackerID:       t.TrackerID,
+		TotalBytes:      uint64(t.Meta.Info.Length),
+		PieceLength:     t.Meta.Info.PieceLength,
+		TotalPieces:     t.pieces.Count(),
+		CompletePieces:  t.pieces.CompletedCount(),
+		BytesLeft:       t.pieces.BytesLeft(),
+		DownloadedBytes: t.downloaded,
+		UploadedBytes:   t.uploaded,
+		PendingRequests: len(t.pending),
+		Peers:           peers,
+	}
+}
+
+func bitCount(bits []byte, pieceCount int) int {
+	count := 0
+	for index := 0; index < pieceCount; index++ {
+		byteIndex := index / 8
+		if byteIndex < len(bits) && bits[byteIndex]&(1<<uint(7-index%8)) != 0 {
+			count++
+		}
+	}
+	return count
 }
 
 const maxPendingPerPeer = 8
@@ -366,6 +477,12 @@ func (t *Torrent) handlePeerMessage(peer *peer, message protocol.Message) error 
 
 	case protocol.Interested:
 		peer.state.PeerInterested = true
+		if peer.state.AmChoking {
+			if err := peer.sendMessage(protocol.Unchoke{}); err != nil {
+				return err
+			}
+			peer.state.AmChoking = false
+		}
 		return nil
 
 	case protocol.NotInterested:

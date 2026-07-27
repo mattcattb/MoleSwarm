@@ -73,6 +73,39 @@ func ReadMetaInfo(r io.Reader) (MetaInfo, error) {
 	}, nil
 }
 
+// EncodeMetaInfo creates canonical single-file v1 metainfo from validated
+// content information. The returned bytes are suitable for distribution as a
+// .torrent file.
+func EncodeMetaInfo(announce string, info Info) ([]byte, MetaInfo, error) {
+	if announce == "" {
+		return nil, MetaInfo{}, fmt.Errorf("%w: announce must be a non-empty string", invalidTorrentFile)
+	}
+
+	pieceBytes := make([]byte, 0, len(info.PieceHashes)*len(PieceHash{}))
+	for _, pieceHash := range info.PieceHashes {
+		pieceBytes = append(pieceBytes, pieceHash[:]...)
+	}
+	value := DictBencoding(BencodingDict{
+		"announce": StringBencoding(announce),
+		"info": DictBencoding(BencodingDict{
+			"length":       IntegerBencoding(info.Length),
+			"name":         StringBencoding(info.Name),
+			"piece length": IntegerBencoding(info.PieceLength),
+			"pieces":       StringBencoding(string(pieceBytes)),
+		}),
+	})
+
+	var encoded bytes.Buffer
+	if err := Encode(&encoded, value); err != nil {
+		return nil, MetaInfo{}, fmt.Errorf("encode metainfo: %w", err)
+	}
+	meta, err := ReadMetaInfo(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		return nil, MetaInfo{}, fmt.Errorf("validate metainfo: %w", err)
+	}
+	return encoded.Bytes(), meta, nil
+}
+
 var invalidTorrentFile = errors.New("invalid metainfo file")
 
 func ParseInfo(info Bencoding) (Info, error) {

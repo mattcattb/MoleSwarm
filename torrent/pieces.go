@@ -60,6 +60,16 @@ func (p *PieceSet) Count() int {
 	return len(p.states)
 }
 
+func (p *PieceSet) CompletedCount() int {
+	complete := 0
+	for _, state := range p.states {
+		if state.Complete {
+			complete++
+		}
+	}
+	return complete
+}
+
 func (p *PieceSet) IsComplete(index uint32) bool {
 	return index < uint32(len(p.states)) && p.states[index].Complete
 }
@@ -228,6 +238,42 @@ func (p *PieceSet) VerifyAndWrite(index uint32, file *os.File) error {
 	piece.Complete = true
 	piece.Data = nil
 	piece.Received = nil
+	return nil
+}
+
+// VerifyExisting marks every piece in file as available only after checking it
+// against the hashes in the metainfo. It is used before a session seeds data
+// that already exists on disk.
+func (p *PieceSet) VerifyExisting(file *os.File) error {
+	if file == nil {
+		return fmt.Errorf("torrent data file is not open")
+	}
+
+	for index := range p.states {
+		pieceIndex := uint32(index)
+		length, err := p.PieceLength(pieceIndex)
+		if err != nil {
+			return err
+		}
+		offset, err := p.PieceOffset(pieceIndex)
+		if err != nil {
+			return err
+		}
+
+		data := make([]byte, length)
+		read, err := file.ReadAt(data, offset)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read piece %d: %w", pieceIndex, err)
+		}
+		if read != len(data) {
+			return fmt.Errorf("read piece %d: %w", pieceIndex, io.ErrUnexpectedEOF)
+		}
+		if protocol.PieceHash(sha1.Sum(data)) != p.info.PieceHashes[pieceIndex] {
+			return fmt.Errorf("verify piece %d: %w", pieceIndex, ErrPieceHashMismatch)
+		}
+
+		p.states[pieceIndex].Complete = true
+	}
 	return nil
 }
 

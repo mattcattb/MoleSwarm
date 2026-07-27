@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,22 +21,73 @@ type trackedPeer struct {
 }
 
 type Server struct {
-	mu       sync.Mutex
-	interval time.Duration
-	peerTTL  time.Duration
-	swarms   map[protocol.InfoHash]map[protocol.PeerID]trackedPeer
+	mu                sync.Mutex
+	interval          time.Duration
+	peerTTL           time.Duration
+	swarms            map[protocol.InfoHash]map[protocol.PeerID]trackedPeer
+	allowedInfoHashes map[protocol.InfoHash]struct{}
 }
 
-func NewServer(interval time.Duration) *Server {
-	if interval <= 0 {
-		interval = 30 * time.Second
+// Snapshot is an immutable observation of the tracker's current swarms.
+type Snapshot struct {
+	IntervalSeconds int64           `json:"intervalSeconds"`
+	PeerTTLSeconds  int64           `json:"peerTtlSeconds"`
+	Swarms          []SwarmSnapshot `json:"swarms"`
+}
+
+type Config struct {
+	AnnounceInterval  time.Duration
+	PeerTTL           time.Duration
+	AllowedInfoHashes []protocol.InfoHash
+}
+
+func (c Config) Validate() error {
+	if c.AnnounceInterval <= 0 {
+		return fmt.Errorf("announce interval must be positive")
+	}
+	if c.AnnounceInterval%time.Second != 0 {
+		return fmt.Errorf("announce interval must be a whole number of seconds")
+	}
+	if c.PeerTTL != 0 && c.PeerTTL < c.AnnounceInterval {
+		return fmt.Errorf("peer TTL must be at least the announce interval")
+	}
+	return nil
+}
+
+type SwarmSnapshot struct {
+	InfoHash string         `json:"infoHash"`
+	Peers    []PeerSnapshot `json:"peers"`
+}
+
+type PeerSnapshot struct {
+	PeerID    string    `json:"peerId"`
+	Address   string    `json:"address"`
+	LastSeen  time.Time `json:"lastSeen"`
+	BytesLeft uint64    `json:"bytesLeft"`
+}
+
+func NewServer(config Config) (*Server, error) {
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	if config.PeerTTL == 0 {
+		config.PeerTTL = 3 * config.AnnounceInterval
+	}
+
+	var allowedInfoHashes map[protocol.InfoHash]struct{}
+	if config.AllowedInfoHashes != nil {
+		allowedInfoHashes = make(map[protocol.InfoHash]struct{}, len(config.AllowedInfoHashes))
+		for _, infoHash := range config.AllowedInfoHashes {
+			allowedInfoHashes[infoHash] = struct{}{}
+		}
 	}
 
 	return &Server{
-		interval: interval,
-		peerTTL:  3 * interval,
-		swarms:   make(map[protocol.InfoHash]map[protocol.PeerID]trackedPeer),
-	}
+		interval:          config.AnnounceInterval,
+		peerTTL:           config.PeerTTL,
+		swarms:            make(map[protocol.InfoHash]map[protocol.PeerID]trackedPeer),
+		allowedInfoHashes: allowedInfoHashes,
+	}, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
@@ -47,6 +99,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	announce, err := decodeAnnounceRequest(request)
 	if err != nil {
 		s.writeFailure(w, "invalid announce request")
+		return
+	}
+	if !s.allows(announce.InfoHash) {
+		s.writeFailure(w, "torrent is not allowed")
 		return
 	}
 
@@ -63,6 +119,66 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	s.writeBencoding(w, encoded)
+}
+
+func (s *Server) allows(infoHash protocol.InfoHash) bool {
+	if s.allowedInfoHashes == nil {
+		return true
+	}
+	_, allowed := s.allowedInfoHashes[infoHash]
+	return allowed
+}
+
+// Snapshot copies tracker state while holding the swarm mutex. Expired peers
+// are pruned first so an observer cannot keep displaying peers past their TTL.
+func (s *Server) Snapshot() Snapshot {
+	return s.snapshot(time.Now())
+}
+
+func (s *Server) snapshot(now time.Time) Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for infoHash := range s.swarms {
+		s.pruneSwarmLocked(infoHash, now)
+	}
+
+	infoHashes := make(map[protocol.InfoHash]struct{}, len(s.swarms)+len(s.allowedInfoHashes))
+	for infoHash := range s.swarms {
+		infoHashes[infoHash] = struct{}{}
+	}
+	for infoHash := range s.allowedInfoHashes {
+		infoHashes[infoHash] = struct{}{}
+	}
+
+	swarms := make([]SwarmSnapshot, 0, len(infoHashes))
+	for infoHash := range infoHashes {
+		peers := make([]PeerSnapshot, 0, len(s.swarms[infoHash]))
+		for peerID, peer := range s.swarms[infoHash] {
+			peers = append(peers, PeerSnapshot{
+				PeerID:    fmt.Sprintf("%x", peerID),
+				Address:   peer.Address.String(),
+				LastSeen:  peer.LastSeen,
+				BytesLeft: peer.Left,
+			})
+		}
+		sort.Slice(peers, func(i, j int) bool {
+			return peers[i].PeerID < peers[j].PeerID
+		})
+		swarms = append(swarms, SwarmSnapshot{
+			InfoHash: fmt.Sprintf("%x", infoHash),
+			Peers:    peers,
+		})
+	}
+	sort.Slice(swarms, func(i, j int) bool {
+		return swarms[i].InfoHash < swarms[j].InfoHash
+	})
+
+	return Snapshot{
+		IntervalSeconds: int64(s.interval / time.Second),
+		PeerTTLSeconds:  int64(s.peerTTL / time.Second),
+		Swarms:          swarms,
+	}
 }
 
 func (s *Server) announce(request AnnounceRequest, address netip.Addr, now time.Time) AnnounceResponse {

@@ -25,6 +25,7 @@ type peer struct {
 	conn     net.Conn
 	id       protocol.PeerID
 	infoHash protocol.InfoHash
+	incoming bool
 	state    peerState
 	bitfield []byte
 	outgoing chan protocol.Message
