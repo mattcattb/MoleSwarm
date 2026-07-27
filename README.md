@@ -10,6 +10,21 @@ tracker
 └── learner-2
 ```
 
+## Container images
+
+Release `0.2.0` publishes the same Go implementation as two multi-platform
+images for Linux amd64 and arm64:
+
+```bash
+docker pull mattbou12/go-torrent:0.2.0
+docker pull mattbou12/go-torrent-tracker:0.2.0
+```
+
+`mattbou12/go-torrent` runs the `torrent` CLI and can download or seed based on
+its command. `mattbou12/go-torrent-tracker` runs the standalone HTTP tracker.
+Versioned tags are the deployment contract; `latest` follows the newest
+published release for local experimentation.
+
 ## Run the local swarm
 
 From the Break My System repository root:
