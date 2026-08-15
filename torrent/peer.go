@@ -6,8 +6,8 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/mattcattb/go-torrent/protocol"
-	"github.com/mattcattb/go-torrent/tracker"
+	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
 const peerWriteQueueSize = 32

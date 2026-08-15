@@ -1,4 +1,4 @@
-# go-torrent
+# MoleSwarm
 
 This system contains an interoperable BitTorrent v1 client and HTTP tracker in
 progress. The first local deployment uses one controlled, single-file swarm:
@@ -52,7 +52,7 @@ docker compose up -d --force-recreate torrent-learner-1 torrent-learner-2
 The root Compose defaults can be changed without editing `docker-compose.yml`:
 
 ```text
-TORRENT_ARTIFACT_DIR                ./systems/go-torrent/artifacts/lesson-payload-v1
+TORRENT_ARTIFACT_DIR                ./systems/mole-swarm/artifacts/lesson-payload-v1
 TORRENT_TRACKER_HOST_PORT           16969
 TORRENT_TRACKER_STATUS_HOST_PORT    18080
 TORRENT_SEED_STATUS_HOST_PORT       18081

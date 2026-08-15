@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 const maxPeersPerAnnounce = 50

@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 const maxResponseSize = 4 << 20

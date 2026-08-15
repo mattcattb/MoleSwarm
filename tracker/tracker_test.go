@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 func TestAnnounceReturnsDictionaryPeers(t *testing.T) {

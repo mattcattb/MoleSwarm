@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 const blockSize uint32 = 16 * 1024

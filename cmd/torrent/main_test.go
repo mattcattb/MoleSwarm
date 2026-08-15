@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
-	"github.com/mattcattb/go-torrent/torrent"
+	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/torrent"
 )
 
 func TestFetchMetaInfoVerifiesDigestAndParsesResponse(t *testing.T) {

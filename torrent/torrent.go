@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 type Torrent struct {
