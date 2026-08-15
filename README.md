@@ -13,7 +13,8 @@ tracker
 ## Container images
 
 Release `0.2.0` publishes the same Go implementation as two multi-platform
-images for Linux amd64 and arm64:
+images for Linux amd64 and arm64. They retain their legacy Docker Hub names
+until renamed images are published:
 
 ```bash
 docker pull mattbou12/go-torrent:0.2.0
