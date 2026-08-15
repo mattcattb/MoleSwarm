@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 type AnnounceEvent string

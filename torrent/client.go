@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
-	"github.com/mattcattb/go-torrent/tracker"
+	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
 // Client owns the process-wide BitTorrent identity and routes incoming peers to

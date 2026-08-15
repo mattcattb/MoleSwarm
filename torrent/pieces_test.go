@@ -7,7 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/mattcattb/go-torrent/protocol"
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 func TestPieceSetWritesVerifiedPieceAndUpdatesLeft(t *testing.T) {

@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattcattb/go-torrent/protocol"
-	"github.com/mattcattb/go-torrent/tracker"
+	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
 func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
