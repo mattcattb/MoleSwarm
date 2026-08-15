@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mattcattb/go-torrent/torrent"
+	"github.com/mattcattb/MoleSwarm/torrent"
 )
 
 func main() {
