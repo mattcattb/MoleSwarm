@@ -277,6 +277,17 @@ func (p *PieceSet) VerifyExisting(file *os.File) error {
 	return nil
 }
 
+func bitCount(bits []byte, pieceCount int) int {
+	count := 0
+	for index := 0; index < pieceCount; index++ {
+		byteIndex := index / 8
+		if byteIndex < len(bits) && bits[byteIndex]&(1<<uint(7-index%8)) != 0 {
+			count++
+		}
+	}
+	return count
+}
+
 func (p *PieceSet) ReadBlock(request protocol.BlockRequest, file *os.File) ([]byte, error) {
 	if file == nil {
 		return nil, fmt.Errorf("torrent output file is not open")
@@ -361,4 +372,16 @@ func allBlocksReceived(piece *PieceState) bool {
 	}
 
 	return true
+}
+
+func (t *Torrent) PiecesBitfield() []byte {
+	bits := make([]byte, (t.pieces.Count()+7)/8)
+	for index := 0; index < t.pieces.Count(); index++ {
+		if !t.pieces.IsComplete(uint32(index)) {
+			continue
+		}
+		byteIndex := index / 8
+		bits[byteIndex] |= 1 << (7 - uint(index)%8)
+	}
+	return bits
 }

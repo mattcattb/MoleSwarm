@@ -60,17 +60,51 @@ func (p *peer) hasPiece(index uint32) bool {
 }
 
 func (p *peer) sendMessage(message protocol.Message) error {
-	if p.queue(message) {
+	if p.tryEnqueue(message) {
 		return nil
 	}
 	return errPeerWriteQueueFull
 }
 
+type peerEventKind uint8
+
+const (
+	peerEventUnknown peerEventKind = iota
+	peerArrived
+	peerMessageReceived
+	peerDisconnected
+)
+
 type peerEvent struct {
-	peer      *peer
-	Connected bool
-	Message   protocol.Message
-	Err       error
+	kind    peerEventKind
+	peer    *peer
+	Message protocol.Message
+	Err     error
+}
+
+func (t *Torrent) handlePeerEvent(ctx context.Context, event peerEvent) {
+
+	switch event.kind {
+
+	case peerArrived:
+
+		err := t.activatePeer(ctx, event.peer)
+
+		if err != nil && event.peer != nil && event.peer.conn != nil {
+			t.closePeer(event.peer)
+
+		}
+	case peerMessageReceived:
+		if !t.hasPeer(event.peer) {
+			return
+		}
+		if err := t.handleProtocolMessage(event.peer, event.Message); err != nil {
+			t.removePeer(event.peer)
+		}
+	case peerDisconnected:
+		t.removePeer(event.peer)
+	}
+
 }
 
 func (p *peer) readLoop(ctx context.Context, events chan<- peerEvent) {
@@ -78,27 +112,41 @@ func (p *peer) readLoop(ctx context.Context, events chan<- peerEvent) {
 	for {
 
 		msg, err := protocol.ReadMessage(p.conn)
-
-		event := peerEvent{
-			peer:    p,
-			Message: msg,
-			Err:     err,
-		}
-
-		select {
-		case events <- event:
-		case <-ctx.Done():
+		if err != nil {
+			select {
+			case events <- peerEvent{
+				kind: peerDisconnected,
+				peer: p,
+				Err:  err,
+			}:
+			case <-ctx.Done():
+			}
 			return
 		}
 
-		if err != nil {
+		select {
+		case events <- peerEvent{
+			kind:    peerMessageReceived,
+			peer:    p,
+			Message: msg,
+		}:
+		case <-ctx.Done():
 			return
 		}
 
 	}
 }
 
-func (p *peer) queue(message protocol.Message) bool {
+func (p *peer) setPiece(index uint32) {
+	byteIndex := index / 8
+	if int(byteIndex) >= len(p.bitfield) {
+		p.bitfield = append(p.bitfield, make([]byte, int(byteIndex)+1-len(p.bitfield))...)
+	}
+
+	p.bitfield[byteIndex] |= byte(1 << (7 - index%8))
+}
+
+func (p *peer) tryEnqueue(message protocol.Message) bool {
 	select {
 	case p.outgoing <- message:
 		return true
@@ -108,15 +156,6 @@ func (p *peer) queue(message protocol.Message) bool {
 	}
 }
 
-func (p *peer) setPieceHave(index uint32) {
-	byteIndex := index / 8
-	mask := byte(1 << (7 - index%8))
-	if int(byteIndex) >= len(p.bitfield) {
-		p.bitfield = append(p.bitfield, make([]byte, int(byteIndex)+1-len(p.bitfield))...)
-	}
-	p.bitfield[byteIndex] |= mask
-}
-
 func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
 	for {
 
@@ -124,7 +163,7 @@ func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
 		case message := <-p.outgoing:
 			if err := protocol.WriteMessage(p.conn, message); err != nil {
 				select {
-				case events <- peerEvent{peer: p, Err: err}:
+				case events <- peerEvent{kind: peerDisconnected, peer: p, Err: err}:
 				case <-ctx.Done():
 
 				}
@@ -136,4 +175,12 @@ func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
 		}
 
 	}
+}
+
+func (t *Torrent) hasPeer(peer *peer) bool {
+	if peer == nil {
+		return false
+	}
+	current, exists := t.peers[peer.id]
+	return exists && current == peer
 }

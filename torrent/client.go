@@ -3,13 +3,19 @@ package torrent
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/mattcattb/MoleSwarm/protocol"
-	"github.com/mattcattb/MoleSwarm/tracker"
+)
+
+var (
+	ErrTorrentNotFound       = errors.New("torrent not found")
+	ErrTorrentAlreadyRunning = errors.New("torrent already running")
+	ErrTorrentNotRunning     = errors.New("torrent not running")
+	ErrTorrentStopped        = errors.New("torrent stopped")
 )
 
 // Client owns the process-wide BitTorrent identity and routes incoming peers to
@@ -17,20 +23,37 @@ import (
 type Client struct {
 	peerID protocol.PeerID
 
-	mu         sync.RWMutex
-	torrents   map[protocol.InfoHash]*Torrent
-	runners    map[protocol.InfoHash]*torrentRunner
-	listenPort uint16
+	mu            sync.RWMutex
+	torrents      map[protocol.InfoHash]*Torrent
+	listenPort    uint16
+	listenAddress net.Addr
 }
 
-type torrentRunner struct {
-	commands chan runnerCommand
-	done     chan struct{}
+type ClientStatus struct {
+	PeerID             string   `json:"peerId"`
+	ListenAddress      string   `json:"listenAddress"`
+	RegisteredTorrents int      `json:"registeredTorrents"`
+	InfoHashes         []string `json:"infoHashes"`
 }
 
-type runnerCommand struct {
-	pause    bool
-	complete chan<- error
+func (c *Client) buildStatus() ClientStatus {
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	infoHashes := make([]string, 0)
+
+	for _, t := range c.torrents {
+		infoHashes = append(infoHashes, string(t.Meta.InfoHash[:]))
+	}
+
+	return ClientStatus{
+		PeerID:             string(c.peerID[:]),
+		ListenAddress:      c.listenAddress.String(),
+		RegisteredTorrents: len(c.torrents),
+		InfoHashes:         infoHashes,
+	}
+
 }
 
 func NewClient() (*Client, error) {
@@ -42,65 +65,45 @@ func NewClient() (*Client, error) {
 	return &Client{
 		peerID:   peerID,
 		torrents: make(map[protocol.InfoHash]*Torrent),
-		runners:  make(map[protocol.InfoHash]*torrentRunner),
 	}, nil
 }
 
-func (c *Client) PeerID() protocol.PeerID {
-	return c.peerID
-}
+// PauseTorrentDownload pauses one running torrent without stopping the client.
+func (c *Client) PauseTorrentDownload(ctx context.Context, infoHash protocol.InfoHash) error {
 
-// PauseTorrent pauses one running torrent without stopping the client.
-func (c *Client) PauseTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
-	return c.setTorrentPaused(ctx, infoHash, true)
-}
+	torrent, exists := c.getTorrent(infoHash)
 
-// ResumeTorrent resumes peer discovery and transfers for one paused torrent.
-func (c *Client) ResumeTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
-	return c.setTorrentPaused(ctx, infoHash, false)
-}
-
-func (c *Client) setTorrentPaused(ctx context.Context, infoHash protocol.InfoHash, pause bool) error {
-	c.mu.RLock()
-	runner, exists := c.runners[infoHash]
-	c.mu.RUnlock()
 	if !exists {
-		return fmt.Errorf("change torrent lifecycle: info hash %x is not running", infoHash)
+		return fmt.Errorf(
+			"pause torrent: info hash %x is not registered",
+			infoHash,
+		)
 	}
 
-	complete := make(chan error, 1)
-	select {
-	case runner.commands <- runnerCommand{pause: pause, complete: complete}:
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-runner.done:
-		return fmt.Errorf("change torrent lifecycle: info hash %x stopped", infoHash)
-	}
+	_, err := torrent.SetPaused(ctx, true)
 
-	select {
-	case err := <-complete:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-runner.done:
-		return fmt.Errorf("change torrent lifecycle: info hash %x stopped", infoHash)
-	}
+	return err
 }
 
-// Listen creates the client listener and records its advertised port before
-// any torrent announces to a tracker.
-func (c *Client) Listen(address string) (net.Listener, error) {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return nil, fmt.Errorf("listen for peers: %w", err)
+// ResumeTorrentDownload resumes peer discovery and transfers for one paused torrent.
+func (c *Client) ResumeTorrentDownload(ctx context.Context, infoHash protocol.InfoHash) error {
+
+	torrent, exists := c.getTorrent(infoHash)
+
+	if !exists {
+		return fmt.Errorf(
+			"pause torrent: info hash %x is not registered",
+			infoHash,
+		)
+
 	}
 
-	c.setListenPort(listener)
-	return listener, nil
+	_, err := torrent.SetPaused(ctx, false)
+	return err
 }
 
-// AddTorrent attaches one swarm session to this process-level client.
-func (c *Client) AddTorrent(torrent *Torrent) error {
+// AddTorrent registers one torrent with this process-level client.
+func (c *Client) RegisterTorrent(torrent *Torrent) error {
 	if torrent == nil {
 		return fmt.Errorf("add torrent: torrent is nil")
 	}
@@ -117,9 +120,9 @@ func (c *Client) AddTorrent(torrent *Torrent) error {
 	return nil
 }
 
-// RemoveTorrent stops one swarm without affecting the client listener or other
-// registered swarms.
-func (c *Client) RemoveTorrent(infoHash protocol.InfoHash) error {
+// RemoveTorrent stops one torrent without affecting the peer listener or other
+// registered torrents.
+func (c *Client) UnregisterTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
 	c.mu.Lock()
 	torrent, exists := c.torrents[infoHash]
 	if exists {
@@ -133,145 +136,39 @@ func (c *Client) RemoveTorrent(infoHash protocol.InfoHash) error {
 	return torrent.Close()
 }
 
-// RunTorrent announces one registered swarm, connects the returned peers, and
+// RunTorrent announces one registered torrent, connects the returned peers, and
 // runs its transfer loop until the context is canceled.
+
 func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
-	c.mu.Lock()
-	torrent, exists := c.torrents[infoHash]
+	torrent, exists := c.getTorrent(infoHash)
 	if !exists {
-		c.mu.Unlock()
 		return fmt.Errorf("run torrent: info hash %x is not registered", infoHash)
 	}
-	if _, running := c.runners[infoHash]; running {
-		c.mu.Unlock()
-		return fmt.Errorf("run torrent: info hash %x is already running", infoHash)
-	}
-	runner := &torrentRunner{
-		commands: make(chan runnerCommand),
-		done:     make(chan struct{}),
-	}
-	c.runners[infoHash] = runner
-	c.mu.Unlock()
-	defer func() {
-		c.mu.Lock()
-		if current := c.runners[infoHash]; current == runner {
-			delete(c.runners, infoHash)
-		}
-		close(runner.done)
-		c.mu.Unlock()
-	}()
 
-	ready := make(chan error, 1)
-	runErr := make(chan error, 1)
-	go func() {
-		runErr <- torrent.run(ctx, ready)
-	}()
-	if err := <-ready; err != nil {
-		return err
-	}
+	config := torrentRunConfig{peerID: c.peerID, port: c.listenPort}
 
-	response, err := c.announce(ctx, torrent, tracker.StartedEvent)
+	return torrent.run(ctx, config)
+}
+
+// ListenForPeers creates the client's peer listener and records its advertised
+// port before any torrent announces to a tracker.
+func (c *Client) ListenForPeers(address string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		_ = torrent.Close()
-		<-runErr
-		return err
+		return nil, fmt.Errorf("listen for peers: %w", err)
 	}
 
-	c.connectAvailablePeers(ctx, torrent, response.Peers)
-
-	interval := trackerInterval(response.Interval)
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
-	var timerC <-chan time.Time = timer.C
-	stopTimer := func() {
-		if timerC == nil {
-			return
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timerC = nil
-	}
-	resetTimer := func(interval time.Duration) {
-		stopTimer()
-		timer.Reset(interval)
-		timerC = timer.C
-	}
-
-	for {
-		select {
-		case err := <-runErr:
-			return err
-
-		case command := <-runner.commands:
-			changed, err := torrent.setPaused(ctx, command.pause)
-			if err == nil && changed {
-				if command.pause {
-					stopTimer()
-					_, _ = c.announce(ctx, torrent, tracker.StoppedEvent)
-				} else {
-					response, announceErr := c.announce(ctx, torrent, tracker.StartedEvent)
-					if announceErr == nil {
-						interval = trackerInterval(response.Interval)
-						c.connectAvailablePeers(ctx, torrent, response.Peers)
-					}
-					resetTimer(interval)
-				}
-			}
-			command.complete <- err
-
-		case <-timerC:
-			response, err := c.announce(ctx, torrent, "")
-			if err == nil {
-				interval = trackerInterval(response.Interval)
-				c.connectAvailablePeers(ctx, torrent, response.Peers)
-			}
-			resetTimer(interval)
-		}
-	}
-}
-
-func trackerInterval(interval time.Duration) time.Duration {
-	if interval < time.Second {
-		return 30 * time.Second
-	}
-	return interval
-}
-
-func (c *Client) connectAvailablePeers(ctx context.Context, torrent *Torrent, candidates []tracker.Peer) {
-	snapshot, err := torrent.Snapshot(ctx)
-	if err != nil || len(snapshot.Peers) != 0 {
-		return
-	}
-	for _, candidate := range candidates {
-		if err := c.connect(ctx, torrent, candidate); err != nil {
-			continue
-		}
-	}
-}
-
-func (c *Client) Serve(ctx context.Context, listener net.Listener) error {
 	c.setListenPort(listener)
-	defer c.closeTorrents()
+	return listener, nil
+}
+
+func (c *Client) ServePeers(ctx context.Context, listener net.Listener) error {
 
 	var pendingMu sync.Mutex
 	pending := make(map[net.Conn]struct{})
-	stopping := false
-	closePending := func() {
-		pendingMu.Lock()
-		defer pendingMu.Unlock()
-
-		stopping = true
-		for conn := range pending {
-			_ = conn.Close()
-		}
-	}
-	defer closePending()
-
 	stopped := make(chan struct{})
+
+	// watch for cancellation to close listener
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -279,8 +176,29 @@ func (c *Client) Serve(ctx context.Context, listener net.Listener) error {
 		case <-stopped:
 		}
 	}()
+
 	defer close(stopped)
 	defer listener.Close()
+
+	var handlers sync.WaitGroup
+
+	defer func() {
+
+		pendingMu.Lock()
+
+		connections := make([]net.Conn, 0, len(pending))
+		for conn := range pending {
+			connections = append(connections, conn)
+		}
+
+		pendingMu.Unlock()
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+
+		handlers.Wait()
+
+	}()
 
 	for {
 		conn, err := listener.Accept()
@@ -292,23 +210,25 @@ func (c *Client) Serve(ctx context.Context, listener net.Listener) error {
 		}
 
 		pendingMu.Lock()
-		if stopping {
-			pendingMu.Unlock()
-			_ = conn.Close()
-			continue
-		}
 		pending[conn] = struct{}{}
 		pendingMu.Unlock()
+		handlers.Add(1)
 
-		go func(conn net.Conn) {
+		go func() {
 			defer func() {
+				handlers.Done()
 				pendingMu.Lock()
 				delete(pending, conn)
 				pendingMu.Unlock()
 			}()
-			c.routeIncomingPeer(ctx, conn)
-		}(conn)
+			err := c.handleIncomingConnection(ctx, conn)
+
+			if err != nil {
+				_ = conn.Close()
+			}
+		}()
 	}
+
 }
 
 func (c *Client) setListenPort(listener net.Listener) {
@@ -323,111 +243,34 @@ func (c *Client) setListenPort(listener net.Listener) {
 	c.listenPort = uint16(address.Port)
 }
 
-func (c *Client) routeIncomingPeer(ctx context.Context, conn net.Conn) {
+func (c *Client) handleIncomingConnection(ctx context.Context, conn net.Conn) error {
 	handshake, err := protocol.ReadHandshake(conn)
 	if err != nil {
-		_ = conn.Close()
-		return
+		return fmt.Errorf("read incomg peer handshake %w", err)
 	}
 
-	torrent, exists := c.torrent(handshake.InfoHash)
+	infoHash := handshake.InfoHash
+
+	torrent, exists := c.getTorrent(infoHash)
 	if !exists {
-		_ = conn.Close()
-		return
+		return fmt.Errorf(
+			"%w: %x",
+			ErrTorrentNotFound,
+			handshake.InfoHash,
+		)
+
 	}
 
-	if err := c.validateHandshake(torrent, handshake); err != nil {
-		_ = conn.Close()
-		return
-	}
-	if err := c.sendPeerHandshake(torrent, conn); err != nil {
-		_ = conn.Close()
-		return
-	}
+	return torrent.acceptIncomingPeer(ctx, conn, handshake, c.peerID)
 
-	peer := newPeer(conn, handshake)
-	peer.incoming = true
-	if !torrent.attachPeer(ctx, peer) {
-		_ = conn.Close()
-	}
 }
 
-func (c *Client) torrent(infoHash protocol.InfoHash) (*Torrent, bool) {
+func (c *Client) getTorrent(infoHash protocol.InfoHash) (*Torrent, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	torrent, exists := c.torrents[infoHash]
 	return torrent, exists
-}
-
-func (c *Client) announce(ctx context.Context, torrent *Torrent, event tracker.AnnounceEvent) (tracker.AnnounceResponse, error) {
-	c.mu.RLock()
-	port := c.listenPort
-	c.mu.RUnlock()
-
-	snapshot, err := torrent.Snapshot(ctx)
-	if err != nil {
-		return tracker.AnnounceResponse{}, err
-	}
-
-	return tracker.Announce(ctx, torrent.Meta.Announce, tracker.AnnounceRequest{
-		Port:       port,
-		Uploaded:   snapshot.UploadedBytes,
-		Downloaded: snapshot.DownloadedBytes,
-		Left:       snapshot.BytesLeft,
-		InfoHash:   torrent.Meta.InfoHash,
-		PeerID:     c.peerID,
-		Compact:    true,
-		Event:      event,
-	})
-}
-
-func (c *Client) connect(ctx context.Context, torrent *Torrent, candidate tracker.Peer) error {
-	conn, err := dialPeer(ctx, candidate)
-	if err != nil {
-		return err
-	}
-	if err := c.sendPeerHandshake(torrent, conn); err != nil {
-		_ = conn.Close()
-		return err
-	}
-
-	handshake, err := protocol.ReadHandshake(conn)
-	if err != nil {
-		_ = conn.Close()
-		return err
-	}
-	if err := c.validateHandshake(torrent, handshake); err != nil {
-		_ = conn.Close()
-		return err
-	}
-
-	peer := newPeer(conn, handshake)
-	if !torrent.attachPeer(ctx, peer) {
-		_ = conn.Close()
-	}
-	return nil
-}
-
-func (c *Client) sendPeerHandshake(torrent *Torrent, conn net.Conn) error {
-	return protocol.WriteHandshake(conn, protocol.Handshake{
-		InfoHash: torrent.Meta.InfoHash,
-		PeerID:   c.peerID,
-		Protocol: protocol.PeerProtocol,
-	})
-}
-
-func (c *Client) validateHandshake(torrent *Torrent, handshake protocol.Handshake) error {
-	if handshake.InfoHash != torrent.Meta.InfoHash {
-		return fmt.Errorf("handshake info hash does not match torrent info hash")
-	}
-	if handshake.PeerID == c.peerID {
-		return fmt.Errorf("peer ID is the same as the client peer ID")
-	}
-	if handshake.Protocol != protocol.PeerProtocol {
-		return fmt.Errorf("invalid peer protocol used")
-	}
-	return nil
 }
 
 func (c *Client) closeTorrents() {
