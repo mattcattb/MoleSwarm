@@ -129,7 +129,7 @@ func TestSeedRejectsSourceDataThatDoesNotMatchMetainfo(t *testing.T) {
 	}
 }
 
-func TestTorrentStatusHandlerReportsRunningSession(t *testing.T) {
+func TestTorrentStatusHandlerReportsRunningTorrent(t *testing.T) {
 	trackerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("d8:intervali30e5:peers0:e"))
 	}))
@@ -150,7 +150,7 @@ func TestTorrentStatusHandlerReportsRunningSession(t *testing.T) {
 	if err := os.WriteFile(dataPath, data, 0o600); err != nil {
 		t.Fatalf("write seed data: %v", err)
 	}
-	session, err := torrent.OpenSeed(meta, dataPath)
+	activeTorrent, err := torrent.OpenSeed(meta, dataPath)
 	if err != nil {
 		t.Fatalf("open seed: %v", err)
 	}
@@ -158,10 +158,10 @@ func TestTorrentStatusHandlerReportsRunningSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	if err := client.AddTorrent(session); err != nil {
+	if err := client.RegisterTorrent(activeTorrent); err != nil {
 		t.Fatalf("add torrent: %v", err)
 	}
-	listener, err := client.Listen("127.0.0.1:0")
+	listener, err := client.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestTorrentStatusHandlerReportsRunningSession(t *testing.T) {
 	for time.Now().Before(deadline) {
 		response = httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
-		torrentStatusHandler(client, session).ServeHTTP(response, request)
+		torrentStatusHandler(client, activeTorrent).ServeHTTP(response, request)
 		if response.Code == http.StatusOK {
 			break
 		}

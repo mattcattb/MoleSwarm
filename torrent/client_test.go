@@ -22,6 +22,19 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
+	trackerAnnounced := make(chan struct{}, 1)
+	trackerServer, err := tracker.NewServer(tracker.Config{AnnounceInterval: time.Second})
+	if err != nil {
+		t.Fatalf("new tracker server: %v", err)
+	}
+	httpTracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		trackerServer.ServeHTTP(w, request)
+		select {
+		case trackerAnnounced <- struct{}{}:
+		default:
+		}
+	}))
+	defer httpTracker.Close()
 
 	firstMeta := protocol.MetaInfo{
 		Info:     infoForTest([]byte("first client routing fixture")),
@@ -31,11 +44,12 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new first torrent: %v", err)
 	}
-	if err := client.AddTorrent(firstSession); err != nil {
+	if err := client.RegisterTorrent(firstSession); err != nil {
 		t.Fatalf("add first torrent: %v", err)
 	}
 
 	routedMeta := protocol.MetaInfo{
+		Announce: httpTracker.URL,
 		Info:     infoForTest([]byte("second client routing fixture")),
 		InfoHash: protocol.InfoHash{4, 5, 6},
 	}
@@ -43,30 +57,32 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new routed torrent: %v", err)
 	}
-	if err := client.AddTorrent(routedSession); err != nil {
+	if err := client.RegisterTorrent(routedSession); err != nil {
 		t.Fatalf("add routed torrent: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := client.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ready := make(chan error, 1)
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- routedSession.run(ctx, ready)
+		runErr <- client.RunTorrent(ctx, routedMeta.InfoHash)
 	}()
-	if err := <-ready; err != nil {
-		cancel()
-		t.Fatalf("run routed torrent: %v", err)
-	}
 
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve(ctx, listener)
+		serveErr <- client.ServePeers(ctx, listener)
 	}()
+
+	select {
+	case <-trackerAnnounced:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("running torrent did not announce to tracker")
+	}
 
 	conn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
@@ -115,7 +131,7 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	if got, want := snapshot.CompletePieces, 0; got != want {
 		t.Errorf("snapshot complete pieces = %d, want %d", got, want)
 	}
-	if got, want := snapshot.State, StateDownloading; got != want {
+	if got, want := snapshot.State, TransferDownloading; got != want {
 		t.Errorf("torrent state = %q, want %q", got, want)
 	}
 	if got, want := len(snapshot.Peers), 1; got != want {
@@ -142,8 +158,22 @@ func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
+	trackerAnnounced := make(chan struct{}, 1)
+	trackerServer, err := tracker.NewServer(tracker.Config{AnnounceInterval: time.Second})
+	if err != nil {
+		t.Fatalf("new tracker server: %v", err)
+	}
+	httpTracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		trackerServer.ServeHTTP(w, request)
+		select {
+		case trackerAnnounced <- struct{}{}:
+		default:
+		}
+	}))
+	defer httpTracker.Close()
 
 	meta := protocol.MetaInfo{
+		Announce: httpTracker.URL,
 		Info:     infoForTest([]byte("known torrent")),
 		InfoHash: protocol.InfoHash{1, 2, 3},
 	}
@@ -151,11 +181,11 @@ func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new torrent: %v", err)
 	}
-	if err := client.AddTorrent(session); err != nil {
+	if err := client.RegisterTorrent(session); err != nil {
 		t.Fatalf("add torrent: %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := client.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -163,8 +193,19 @@ func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve(ctx, listener)
+		serveErr <- client.ServePeers(ctx, listener)
 	}()
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- client.RunTorrent(ctx, meta.InfoHash)
+	}()
+
+	select {
+	case <-trackerAnnounced:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("known torrent did not announce to tracker")
+	}
 
 	unknownConn, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
@@ -212,6 +253,9 @@ func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
 	if err := <-serveErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("serve error = %v, want context canceled", err)
 	}
+	if err := <-runErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("run error = %v, want context canceled", err)
+	}
 }
 
 func TestClientCancellationClosesPendingHandshake(t *testing.T) {
@@ -232,7 +276,7 @@ func TestClientCancellationClosesPendingHandshake(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve(ctx, listener)
+		serveErr <- client.ServePeers(ctx, listener)
 	}()
 
 	conn, err := net.Dial("tcp", listener.Addr().String())
@@ -296,16 +340,16 @@ func TestClientsDiscoverAndConnectThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new first torrent: %v", err)
 	}
-	if err := firstClient.AddTorrent(firstTorrent); err != nil {
+	if err := firstClient.RegisterTorrent(firstTorrent); err != nil {
 		t.Fatalf("add first torrent: %v", err)
 	}
-	firstListener, err := firstClient.Listen("127.0.0.1:0")
+	firstListener, err := firstClient.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for first client: %v", err)
 	}
 	firstServeErr := make(chan error, 1)
 	go func() {
-		firstServeErr <- firstClient.Serve(ctx, firstListener)
+		firstServeErr <- firstClient.ServePeers(ctx, firstListener)
 	}()
 	firstRunErr := make(chan error, 1)
 	go func() {
@@ -326,16 +370,16 @@ func TestClientsDiscoverAndConnectThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new second torrent: %v", err)
 	}
-	if err := secondClient.AddTorrent(secondTorrent); err != nil {
+	if err := secondClient.RegisterTorrent(secondTorrent); err != nil {
 		t.Fatalf("add second torrent: %v", err)
 	}
-	secondListener, err := secondClient.Listen("127.0.0.1:0")
+	secondListener, err := secondClient.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for second client: %v", err)
 	}
 	secondServeErr := make(chan error, 1)
 	go func() {
-		secondServeErr <- secondClient.Serve(ctx, secondListener)
+		secondServeErr <- secondClient.ServePeers(ctx, secondListener)
 	}()
 	secondRunErr := make(chan error, 1)
 	go func() {
@@ -365,7 +409,7 @@ func TestClientsDiscoverAndConnectThroughTracker(t *testing.T) {
 	}
 }
 
-func TestClientReannouncesAtTrackerInterval(t *testing.T) {
+func TestTorrentReannouncesAtTrackerInterval(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -396,16 +440,16 @@ func TestClientReannouncesAtTrackerInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new torrent: %v", err)
 	}
-	if err := client.AddTorrent(session); err != nil {
+	if err := client.RegisterTorrent(session); err != nil {
 		t.Fatalf("add torrent: %v", err)
 	}
-	listener, err := client.Listen("127.0.0.1:0")
+	listener, err := client.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve(ctx, listener)
+		serveErr <- client.ServePeers(ctx, listener)
 	}()
 	runErr := make(chan error, 1)
 	go func() {
@@ -429,7 +473,7 @@ func TestClientReannouncesAtTrackerInterval(t *testing.T) {
 	}
 }
 
-func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
+func TestTorrentPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
@@ -457,16 +501,16 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new torrent: %v", err)
 	}
-	if err := client.AddTorrent(session); err != nil {
+	if err := client.RegisterTorrent(session); err != nil {
 		t.Fatalf("add torrent: %v", err)
 	}
-	listener, err := client.Listen("127.0.0.1:0")
+	listener, err := client.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- client.Serve(ctx, listener)
+		serveErr <- client.ServePeers(ctx, listener)
 	}()
 	runErr := make(chan error, 1)
 	go func() {
@@ -476,7 +520,7 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	if err := waitForTrackerEvent(ctx, announces, tracker.StartedEvent); err != nil {
 		t.Fatalf("initial announce: %v", err)
 	}
-	if err := client.PauseTorrent(ctx, meta.InfoHash); err != nil {
+	if err := client.PauseTorrentDownload(ctx, meta.InfoHash); err != nil {
 		t.Fatalf("pause torrent: %v", err)
 	}
 	if err := waitForTrackerEvent(ctx, announces, tracker.StoppedEvent); err != nil {
@@ -486,7 +530,7 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot paused torrent: %v", err)
 	}
-	if got, want := paused.State, StatePaused; got != want {
+	if got, want := paused.State, TransferPaused; got != want {
 		t.Errorf("paused state = %q, want %q", got, want)
 	}
 
@@ -496,7 +540,7 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	case <-time.After(1200 * time.Millisecond):
 	}
 
-	if err := client.ResumeTorrent(ctx, meta.InfoHash); err != nil {
+	if err := client.ResumeTorrentDownload(ctx, meta.InfoHash); err != nil {
 		t.Fatalf("resume torrent: %v", err)
 	}
 	if err := waitForTrackerEvent(ctx, announces, tracker.StartedEvent); err != nil {
@@ -506,7 +550,7 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot resumed torrent: %v", err)
 	}
-	if got, want := resumed.State, StateDownloading; got != want {
+	if got, want := resumed.State, TransferDownloading; got != want {
 		t.Errorf("resumed state = %q, want %q", got, want)
 	}
 	if err := waitForTrackerEvent(ctx, announces, ""); err != nil {
@@ -524,7 +568,22 @@ func TestClientPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 
 func TestTorrentPauseDisconnectsPeersAndPreservesVerifiedPieces(t *testing.T) {
 	data := []byte("pause keeps verified torrent data")
+	trackerAnnounced := make(chan struct{}, 1)
+	trackerServer, err := tracker.NewServer(tracker.Config{AnnounceInterval: time.Second})
+	if err != nil {
+		t.Fatalf("new tracker server: %v", err)
+	}
+	httpTracker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		trackerServer.ServeHTTP(w, request)
+		select {
+		case trackerAnnounced <- struct{}{}:
+		default:
+		}
+	}))
+	defer httpTracker.Close()
+
 	meta := protocol.MetaInfo{
+		Announce: httpTracker.URL,
 		Info:     infoForTest(data),
 		InfoHash: protocol.InfoHash{7, 4},
 	}
@@ -537,42 +596,76 @@ func TestTorrentPauseDisconnectsPeersAndPreservesVerifiedPieces(t *testing.T) {
 		t.Fatalf("open seed: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	ready := make(chan error, 1)
-	runErr := make(chan error, 1)
-	go func() {
-		runErr <- session.run(ctx, ready)
-	}()
-	if err := <-ready; err != nil {
-		cancel()
-		t.Fatalf("run torrent: %v", err)
+	client, err := NewClient()
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	if err := client.RegisterTorrent(session); err != nil {
+		t.Fatalf("register torrent: %v", err)
+	}
+	listener, err := client.ListenForPeers("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for peers: %v", err)
 	}
 
-	firstLocal, firstRemote := net.Pipe()
-	defer firstRemote.Close()
-	firstPeer := newPeer(firstLocal, protocol.Handshake{
-		PeerID: protocol.PeerID{1},
-	})
-	if !session.attachPeer(ctx, firstPeer) {
-		cancel()
-		t.Fatal("attach peer before pause")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- client.ServePeers(ctx, listener)
+	}()
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- client.RunTorrent(ctx, meta.InfoHash)
+	}()
+
+	select {
+	case <-trackerAnnounced:
+	case <-ctx.Done():
+		t.Fatalf("running torrent did not announce: %v", ctx.Err())
 	}
+
+	connectIncomingPeer := func(peerID protocol.PeerID) net.Conn {
+		t.Helper()
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatalf("dial client: %v", err)
+		}
+		if err := protocol.WriteHandshake(conn, protocol.Handshake{
+			InfoHash: meta.InfoHash,
+			PeerID:   peerID,
+			Protocol: protocol.PeerProtocol,
+		}); err != nil {
+			_ = conn.Close()
+			t.Fatalf("write incoming handshake: %v", err)
+		}
+		response, err := protocol.ReadHandshake(conn)
+		if err != nil {
+			_ = conn.Close()
+			t.Fatalf("read client handshake: %v", err)
+		}
+		if response.InfoHash != meta.InfoHash {
+			_ = conn.Close()
+			t.Fatalf("response info hash = %x, want %x", response.InfoHash, meta.InfoHash)
+		}
+		return conn
+	}
+
+	firstRemote := connectIncomingPeer(protocol.PeerID{1})
+	defer firstRemote.Close()
 	if err := waitForPeerCount(ctx, session, 1); err != nil {
-		cancel()
 		t.Fatalf("wait for peer before pause: %v", err)
 	}
 
-	if _, err := session.setPaused(ctx, true); err != nil {
-		cancel()
+	if err := client.PauseTorrentDownload(ctx, meta.InfoHash); err != nil {
 		t.Fatalf("pause torrent: %v", err)
 	}
 	paused, err := session.Snapshot(ctx)
 	if err != nil {
-		cancel()
 		t.Fatalf("snapshot paused torrent: %v", err)
 	}
-	if paused.State != StatePaused {
-		t.Errorf("paused state = %q, want %q", paused.State, StatePaused)
+	if paused.State != TransferPaused {
+		t.Errorf("paused state = %q, want %q", paused.State, TransferPaused)
 	}
 	if got := len(paused.Peers); got != 0 {
 		t.Errorf("paused peer count = %d, want 0", got)
@@ -581,29 +674,19 @@ func TestTorrentPauseDisconnectsPeersAndPreservesVerifiedPieces(t *testing.T) {
 		t.Errorf("paused complete pieces = %d, want %d", got, want)
 	}
 
-	pausedLocal, pausedRemote := net.Pipe()
+	pausedRemote := connectIncomingPeer(protocol.PeerID{2})
 	defer pausedRemote.Close()
-	if !session.attachPeer(ctx, newPeer(pausedLocal, protocol.Handshake{
-		PeerID: protocol.PeerID{2},
-	})) {
-		cancel()
-		t.Fatal("route paused peer to event loop")
-	}
 	if err := pausedRemote.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		cancel()
 		t.Fatalf("set paused peer deadline: %v", err)
 	}
 	var response [1]byte
 	if _, err := pausedRemote.Read(response[:]); err == nil {
-		cancel()
 		t.Fatal("paused torrent kept an incoming peer connection open")
 	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		cancel()
 		t.Fatal("paused torrent did not reject the incoming peer")
 	}
 
-	if _, err := session.setPaused(ctx, false); err != nil {
-		cancel()
+	if err := client.ResumeTorrentDownload(ctx, meta.InfoHash); err != nil {
 		t.Fatalf("resume torrent: %v", err)
 	}
 	resumed, err := session.Snapshot(ctx)
@@ -611,14 +694,17 @@ func TestTorrentPauseDisconnectsPeersAndPreservesVerifiedPieces(t *testing.T) {
 		cancel()
 		t.Fatalf("snapshot resumed torrent: %v", err)
 	}
-	if resumed.State != StateSeeding {
-		t.Errorf("resumed state = %q, want %q", resumed.State, StateSeeding)
+	if resumed.State != TransferCompleted {
+		t.Errorf("resumed state = %q, want %q", resumed.State, TransferCompleted)
 	}
 	if got, want := resumed.CompletePieces, 1; got != want {
 		t.Errorf("resumed complete pieces = %d, want %d", got, want)
 	}
 
 	cancel()
+	if err := <-serveErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("serve error = %v, want context canceled", err)
+	}
 	if err := <-runErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("run error = %v, want context canceled", err)
 	}
@@ -661,16 +747,16 @@ func TestSeederTransfersVerifiedPieceToLeecherThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new seed client: %v", err)
 	}
-	if err := seedClient.AddTorrent(seeder); err != nil {
+	if err := seedClient.RegisterTorrent(seeder); err != nil {
 		t.Fatalf("add seed torrent: %v", err)
 	}
-	seedListener, err := seedClient.Listen("127.0.0.1:0")
+	seedListener, err := seedClient.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for seed: %v", err)
 	}
 	seedServeErr := make(chan error, 1)
 	go func() {
-		seedServeErr <- seedClient.Serve(ctx, seedListener)
+		seedServeErr <- seedClient.ServePeers(ctx, seedListener)
 	}()
 	seedRunErr := make(chan error, 1)
 	go func() {
@@ -684,7 +770,7 @@ func TestSeederTransfersVerifiedPieceToLeecherThroughTracker(t *testing.T) {
 	}
 
 	outputPath := filepath.Join(t.TempDir(), "downloaded.txt")
-	leecher, err := OpenTorrent(meta, outputPath)
+	leecher, err := OpenDownload(meta, outputPath)
 	if err != nil {
 		t.Fatalf("open leecher torrent: %v", err)
 	}
@@ -692,16 +778,16 @@ func TestSeederTransfersVerifiedPieceToLeecherThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new leecher client: %v", err)
 	}
-	if err := leecherClient.AddTorrent(leecher); err != nil {
+	if err := leecherClient.RegisterTorrent(leecher); err != nil {
 		t.Fatalf("add leecher torrent: %v", err)
 	}
-	leecherListener, err := leecherClient.Listen("127.0.0.1:0")
+	leecherListener, err := leecherClient.ListenForPeers("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen for leecher: %v", err)
 	}
 	leecherServeErr := make(chan error, 1)
 	go func() {
-		leecherServeErr <- leecherClient.Serve(ctx, leecherListener)
+		leecherServeErr <- leecherClient.ServePeers(ctx, leecherListener)
 	}()
 	leecherRunErr := make(chan error, 1)
 	go func() {

@@ -217,12 +217,12 @@ func seed(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	session, err := torrent.OpenSeed(meta, *dataPath)
+	activeTorrent, err := torrent.OpenSeed(meta, *dataPath)
 	if err != nil {
 		return fmt.Errorf("open torrent seed: %w", err)
 	}
 
-	return runSession(ctx, session, *listenAddress, *statusAddress)
+	return runSingleTorrent(ctx, activeTorrent, *listenAddress, *statusAddress)
 }
 
 func download(ctx context.Context, args []string) error {
@@ -261,23 +261,23 @@ func download(ctx context.Context, args []string) error {
 		return fmt.Errorf("create output directory: %w", err)
 	}
 
-	session, err := torrent.OpenTorrent(meta, *outputPath)
+	activeTorrent, err := torrent.OpenDownload(meta, *outputPath)
 	if err != nil {
 		return fmt.Errorf("open torrent session: %w", err)
 	}
-	return runSession(ctx, session, *listenAddress, *statusAddress)
+	return runSingleTorrent(ctx, activeTorrent, *listenAddress, *statusAddress)
 }
 
-func runSession(ctx context.Context, session *torrent.Torrent, listenAddress, statusAddress string) error {
+func runSingleTorrent(ctx context.Context, activeTorrent *torrent.Torrent, listenAddress, statusAddress string) error {
 	client, err := torrent.NewClient()
 	if err != nil {
 		return fmt.Errorf("create torrent client: %w", err)
 	}
-	if err := client.AddTorrent(session); err != nil {
+	if err := client.RegisterTorrent(activeTorrent); err != nil {
 		return fmt.Errorf("add torrent: %w", err)
 	}
 
-	listener, err := client.Listen(listenAddress)
+	listener, err := client.ListenForPeers(listenAddress)
 	if err != nil {
 		return err
 	}
@@ -296,15 +296,17 @@ func runSession(ctx context.Context, session *torrent.Torrent, listenAddress, st
 	results := make(chan error, 3)
 	componentCount := 2
 	go func() {
-		results <- client.Serve(runCtx, listener)
+		results <- client.ServePeers(runCtx, listener)
 	}()
 	go func() {
-		results <- client.RunTorrent(runCtx, session.Meta.InfoHash)
+		results <- client.RunTorrent(runCtx, activeTorrent.Meta.InfoHash)
 	}()
 	if statusListener != nil {
 		componentCount++
+		handler := torrentStatusHandler(client, activeTorrent)
+
 		go func() {
-			results <- serveTorrentStatus(runCtx, statusListener, client, session)
+			results <- serveTorrentStatus(runCtx, statusListener, handler)
 		}()
 	}
 
@@ -329,17 +331,17 @@ func runSession(ctx context.Context, session *torrent.Torrent, listenAddress, st
 }
 
 type torrentStatusResponse struct {
-	PeerID  string           `json:"peerId"`
-	Torrent torrent.Snapshot `json:"torrent"`
+	PeerID  string         `json:"peerId"`
+	Torrent torrent.Status `json:"torrent"`
 }
 
-func torrentStatusHandler(client *torrent.Client, session *torrent.Torrent) http.Handler {
+func torrentStatusHandler(client *torrent.Client, activeTorrent *torrent.Torrent) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /v1/snapshot", func(w http.ResponseWriter, request *http.Request) {
-		snapshot, err := session.Snapshot(request.Context())
+		snapshot, err := activeTorrent.Snapshot(request.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
@@ -347,7 +349,7 @@ func torrentStatusHandler(client *torrent.Client, session *torrent.Torrent) http
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(torrentStatusResponse{
-			PeerID:  fmt.Sprintf("%x", client.PeerID()),
+			PeerID:  fmt.Sprintf("%x", client.()),
 			Torrent: snapshot,
 		}); err != nil {
 			http.Error(w, "encode torrent snapshot", http.StatusInternalServerError)
@@ -359,10 +361,9 @@ func torrentStatusHandler(client *torrent.Client, session *torrent.Torrent) http
 func serveTorrentStatus(
 	ctx context.Context,
 	listener net.Listener,
-	client *torrent.Client,
-	session *torrent.Torrent,
+	handler http.Handler,
 ) error {
-	server := &http.Server{Handler: torrentStatusHandler(client, session)}
+	server := &http.Server{Handler: handler}
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
