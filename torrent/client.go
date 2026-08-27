@@ -36,7 +36,11 @@ type ClientStatus struct {
 	InfoHashes         []string `json:"infoHashes"`
 }
 
-func (c *Client) buildStatus() ClientStatus {
+func (c *Client) PeerID() protocol.PeerID {
+	return c.peerID
+}
+
+func (c *Client) Status() ClientStatus {
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()

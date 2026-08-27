@@ -196,7 +196,6 @@ func (t *Torrent) updateInterest(peer *peer) error {
 	}
 
 	if interested {
-
 		if err := peer.sendMessage(protocol.Interested{}); err != nil {
 			return err
 		}

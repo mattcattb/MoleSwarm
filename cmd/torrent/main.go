@@ -349,7 +349,7 @@ func torrentStatusHandler(client *torrent.Client, activeTorrent *torrent.Torrent
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(torrentStatusResponse{
-			PeerID:  fmt.Sprintf("%x", client.()),
+			PeerID:  fmt.Sprintf("%x", client.PeerID()),
 			Torrent: snapshot,
 		}); err != nil {
 			http.Error(w, "encode torrent snapshot", http.StatusInternalServerError)

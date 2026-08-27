@@ -17,14 +17,14 @@ type Torrent struct {
 	Meta protocol.MetaInfo
 
 	// torrent run manages
-	pieces     PieceSet
-	file       *os.File
-	pending    map[protocol.BlockRequest]*peer
-	peers      map[protocol.PeerID]*peer
-	uploaded   uint64
-	downloaded uint64
-	paused     bool
-	TrackerID  string
+	pieces         PieceSet
+	file           *os.File
+	pending        map[protocol.BlockRequest]*peer
+	peers          map[protocol.PeerID]*peer
+	uploaded       uint64
+	downloaded     uint64
+	DownloadPaused bool
+	TrackerID      string
 
 	// consumed by torrent.run
 	peerEvents       chan peerEvent
@@ -298,7 +298,7 @@ func (t *Torrent) run(ctx context.Context, config torrentRunConfig) (err error) 
 }
 
 func (t *Torrent) transferState() TransferState {
-	if t.paused {
+	if t.DownloadPaused {
 		return TransferPaused
 	}
 	if t.pieces.Complete() {
@@ -317,20 +317,12 @@ func (t *Torrent) releasePendingRequests(peer *peer) {
 	}
 }
 
-func (t *Torrent) broadcastMessage(message protocol.Message) {
-	for _, peer := range t.peers {
-		if err := peer.sendMessage(message); err != nil {
-			t.removePeer(peer)
-		}
-	}
-}
-
 func (t *Torrent) activatePeer(ctx context.Context, peer *peer) error {
 	if peer == nil {
 		return errors.New("peer is nil")
 	}
 
-	if t.paused {
+	if t.DownloadPaused {
 		return errors.New("torrent is paused")
 	}
 
@@ -426,15 +418,29 @@ func (t *Torrent) closeFile() error {
 	return err
 }
 
-func (t *Torrent) applyPaused(paused bool) bool {
+func (t *Torrent) pauseDownload() {
 
-	changed := t.paused != paused
+}
+
+func (t *Torrent) resumeDownload() {}
+
+func (t *Torrent) applyPaused(paused bool) (changed bool) {
+
+	if t.DownloadPaused == paused {
+		return false
+	}
+
+	if paused {
+		t.DownloadPaused = true
+		// send a peer message that we are not interested
+		t.broadcastMessage(protocol.NotInterested{})
+	}
 
 	if !changed {
 		return false
 	}
 
-	t.paused = paused
+	t.DownloadPaused = paused
 
 	if paused {
 		t.closePeers()
