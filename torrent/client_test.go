@@ -109,8 +109,8 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	if response.InfoHash != routedMeta.InfoHash {
 		t.Fatalf("response info hash = %x, want %x", response.InfoHash, routedMeta.InfoHash)
 	}
-	if response.PeerID != client.PeerID() {
-		t.Fatalf("response peer ID = %x, want client peer ID %x", response.PeerID, client.PeerID())
+	if response.PeerID != client.peerID {
+		t.Fatalf("response peer ID = %x, want client peer ID %x", response.PeerID, client.peerID)
 	}
 
 	if err := waitForPeerCount(ctx, routedSession, 1); err != nil {
