@@ -156,7 +156,7 @@ func TestPieceSetVerifyExistingRejectsHashMismatch(t *testing.T) {
 
 func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	data := []byte("a complete one-block piece")
-	torrent, err := NewTorrent(protocol.MetaInfo{Info: infoForTest(data)})
+	torrent, err := New(protocol.MetaInfo{Info: infoForTest(data)})
 	if err != nil {
 		t.Fatalf("new torrent: %v", err)
 	}

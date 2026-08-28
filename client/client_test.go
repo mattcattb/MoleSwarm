@@ -1,4 +1,4 @@
-package torrent
+package client
 
 import (
 	"bytes"
@@ -14,11 +14,12 @@ import (
 	"time"
 
 	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/torrent"
 	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
 func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -53,7 +54,7 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 		Info:     infoForTest([]byte("second client routing fixture")),
 		InfoHash: protocol.InfoHash{4, 5, 6},
 	}
-	routedSession, err := NewTorrent(routedMeta)
+	routedSession, err := torrent.New(routedMeta)
 	if err != nil {
 		t.Fatalf("new routed torrent: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- client.RunTorrent(ctx, routedMeta.InfoHash)
+		runErr <- client.StartTorrentDownload(ctx, routedMeta.InfoHash)
 	}()
 
 	serveErr := make(chan error, 1)
@@ -154,7 +155,7 @@ func TestClientRoutesRegisteredInfoHashUsingSharedIdentity(t *testing.T) {
 }
 
 func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -259,7 +260,7 @@ func TestClientRejectsUnknownInfoHashWithoutStoppingListener(t *testing.T) {
 }
 
 func TestClientCancellationClosesPendingHandshake(t *testing.T) {
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -332,7 +333,7 @@ func TestClientsDiscoverAndConnectThroughTracker(t *testing.T) {
 		InfoHash: protocol.InfoHash{1, 2, 3},
 	}
 
-	firstClient, err := NewClient()
+	firstClient, err := New()
 	if err != nil {
 		t.Fatalf("new first client: %v", err)
 	}
@@ -362,7 +363,7 @@ func TestClientsDiscoverAndConnectThroughTracker(t *testing.T) {
 		t.Fatalf("first client did not announce: %v", ctx.Err())
 	}
 
-	secondClient, err := NewClient()
+	secondClient, err := New()
 	if err != nil {
 		t.Fatalf("new second client: %v", err)
 	}
@@ -432,7 +433,7 @@ func TestTorrentReannouncesAtTrackerInterval(t *testing.T) {
 		Info:     infoForTest([]byte("periodic announce fixture")),
 		InfoHash: protocol.InfoHash{8, 5},
 	}
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -493,7 +494,7 @@ func TestTorrentPauseAndResumeCoordinateTrackerLifecycle(t *testing.T) {
 		Info:     infoForTest([]byte("pause and resume tracker lifecycle")),
 		InfoHash: protocol.InfoHash{6, 2},
 	}
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -596,7 +597,7 @@ func TestTorrentPauseDisconnectsPeersAndPreservesVerifiedPieces(t *testing.T) {
 		t.Fatalf("open seed: %v", err)
 	}
 
-	client, err := NewClient()
+	client, err := New()
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
@@ -743,7 +744,7 @@ func TestSeederTransfersVerifiedPieceToLeecherThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open seed: %v", err)
 	}
-	seedClient, err := NewClient()
+	seedClient, err := New()
 	if err != nil {
 		t.Fatalf("new seed client: %v", err)
 	}
@@ -774,7 +775,7 @@ func TestSeederTransfersVerifiedPieceToLeecherThroughTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open leecher torrent: %v", err)
 	}
-	leecherClient, err := NewClient()
+	leecherClient, err := New()
 	if err != nil {
 		t.Fatalf("new leecher client: %v", err)
 	}

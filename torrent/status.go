@@ -1,9 +1,15 @@
 package torrent
 
 import (
-	"context"
 	"fmt"
 	"sort"
+)
+
+type downloadMode string
+
+const (
+	downloadModeProgress downloadMode = "progress"
+	downloadModePaused   downloadMode = "paused"
 )
 
 type TransferState string
@@ -18,29 +24,25 @@ const (
 // event loop constructs it so observers never read mutable peer, request, or
 // piece state directly.
 
-type snapshotRequest struct {
-	reply chan<- Status
-}
-
 type Status struct {
-	State           TransferState  `json:"state"`
-	InfoHash        string         `json:"infoHash"`
-	Name            string         `json:"name"`
-	Tracker         string         `json:"tracker"`
-	TrackerID       string         `json:"trackerId,omitempty"`
-	TotalBytes      uint64         `json:"totalBytes"`
-	PieceLength     int64          `json:"pieceLength"`
-	TotalPieces     int            `json:"totalPieces"`
-	CompletePieces  int            `json:"completePieces"`
-	BytesLeft       uint64         `json:"bytesLeft"`
-	DownloadedBytes uint64         `json:"downloadedBytes"`
-	UploadedBytes   uint64         `json:"uploadedBytes"`
-	PendingRequests int            `json:"pendingRequests"`
-	Peers           []PeerSnapshot `json:"peers"`
+	State           TransferState `json:"state"`
+	InfoHash        string        `json:"infoHash"`
+	Name            string        `json:"name"`
+	Tracker         string        `json:"tracker"`
+	TrackerID       string        `json:"trackerId,omitempty"`
+	TotalBytes      uint64        `json:"totalBytes"`
+	PieceLength     int64         `json:"pieceLength"`
+	TotalPieces     int           `json:"totalPieces"`
+	CompletePieces  int           `json:"completePieces"`
+	BytesLeft       uint64        `json:"bytesLeft"`
+	DownloadedBytes uint64        `json:"downloadedBytes"`
+	UploadedBytes   uint64        `json:"uploadedBytes"`
+	PendingRequests int           `json:"pendingRequests"`
+	Peers           []PeerStatus  `json:"peers"`
 }
 
-// PeerSnapshot contains protocol state owned by the torrent event loop.
-type PeerSnapshot struct {
+// PeerStatus contains protocol state owned by the torrent event loop.
+type PeerStatus struct {
 	PeerID          string `json:"peerId"`
 	Address         string `json:"address"`
 	Incoming        bool   `json:"incoming"`
@@ -52,54 +54,14 @@ type PeerSnapshot struct {
 	PendingRequests int    `json:"pendingRequests"`
 }
 
-func (t *Torrent) Snapshot(ctx context.Context) (Status, error) {
-	t.lifecycleMu.Lock()
-	running := t.running
-	done := t.done
-	t.lifecycleMu.Unlock()
-	if !running {
-		return Status{}, fmt.Errorf("torrent is not running")
-	}
-
-	// here we need to request from the torrent a snapshot, and then wait for that snapshot channel to return from that channel the snapshot
-
-	snapshotReply := make(chan Status)
-
-	snapshotRequest := snapshotRequest{
-		reply: snapshotReply,
-	}
-
-	select {
-
-	case t.snapshotRequests <- snapshotRequest:
-
-	case <-ctx.Done():
-		return Status{}, ctx.Err()
-	case <-done:
-		return Status{}, fmt.Errorf("torrent completed before snapshot request")
-	}
-
-	// wait for response
-	select {
-	case resp := <-snapshotReply:
-
-		return resp, nil
-
-	case <-ctx.Done():
-		return Status{}, ctx.Err()
-	case <-done:
-		return Status{}, fmt.Errorf("torrent completed before snapshot request")
-	}
-}
-
-func (t *Torrent) buildSnapshot() Status {
-	peers := make([]PeerSnapshot, 0, len(t.peers))
+func (t *Torrent) buildStatus() Status {
+	peers := make([]PeerStatus, 0, len(t.peers))
 	for _, peer := range t.peers {
 		address := ""
 		if peer.conn != nil && peer.conn.RemoteAddr() != nil {
 			address = peer.conn.RemoteAddr().String()
 		}
-		peers = append(peers, PeerSnapshot{
+		peers = append(peers, PeerStatus{
 			PeerID:          fmt.Sprintf("%x", peer.id),
 			Address:         address,
 			Incoming:        peer.incoming,
@@ -131,4 +93,14 @@ func (t *Torrent) buildSnapshot() Status {
 		PendingRequests: len(t.pending),
 		Peers:           peers,
 	}
+}
+
+func (t *Torrent) transferState() TransferState {
+	if t.downloadMode == downloadModePaused {
+		return TransferPaused
+	}
+	if t.pieces.Complete() {
+		return TransferCompleted
+	}
+	return TransferDownloading
 }

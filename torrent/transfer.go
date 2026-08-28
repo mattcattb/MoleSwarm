@@ -111,6 +111,10 @@ func (t *Torrent) fillRequestWindow(peer *peer) error {
 		return nil
 	}
 
+	if t.downloadMode == downloadModePaused {
+		return nil
+	}
+
 	if peer.state.PeerChoking || !peer.state.AmInterested {
 		return nil
 	}

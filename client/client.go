@@ -1,4 +1,4 @@
-package torrent
+package client
 
 import (
 	"context"
@@ -8,14 +8,14 @@ import (
 	"net"
 	"sync"
 
+	"github.com/mattcattb/MoleSwarm/torrent"
+
 	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 var (
-	ErrTorrentNotFound       = errors.New("torrent not found")
-	ErrTorrentAlreadyRunning = errors.New("torrent already running")
-	ErrTorrentNotRunning     = errors.New("torrent not running")
-	ErrTorrentStopped        = errors.New("torrent stopped")
+	ErrTorrentNotFound          = errors.New("torrent not found")
+	ErrTorrentAlreadyRegistered = errors.New("torrent already registered")
 )
 
 // Client owns the process-wide BitTorrent identity and routes incoming peers to
@@ -24,7 +24,7 @@ type Client struct {
 	peerID protocol.PeerID
 
 	mu            sync.RWMutex
-	torrents      map[protocol.InfoHash]*Torrent
+	torrents      map[protocol.InfoHash]*torrent.Torrent
 	listenPort    uint16
 	listenAddress net.Addr
 }
@@ -60,7 +60,7 @@ func (c *Client) Status() ClientStatus {
 
 }
 
-func NewClient() (*Client, error) {
+func New() (*Client, error) {
 	var peerID protocol.PeerID
 	if _, err := rand.Read(peerID[:]); err != nil {
 		return nil, fmt.Errorf("generate peer ID: %w", err)
@@ -68,7 +68,7 @@ func NewClient() (*Client, error) {
 
 	return &Client{
 		peerID:   peerID,
-		torrents: make(map[protocol.InfoHash]*Torrent),
+		torrents: make(map[protocol.InfoHash]*torrent.Torrent),
 	}, nil
 }
 
@@ -84,9 +84,8 @@ func (c *Client) PauseTorrentDownload(ctx context.Context, infoHash protocol.Inf
 		)
 	}
 
-	_, err := torrent.SetPaused(ctx, true)
+	return torrent.PauseDownload(ctx)
 
-	return err
 }
 
 // ResumeTorrentDownload resumes peer discovery and transfers for one paused torrent.
@@ -102,12 +101,11 @@ func (c *Client) ResumeTorrentDownload(ctx context.Context, infoHash protocol.In
 
 	}
 
-	_, err := torrent.SetPaused(ctx, false)
-	return err
+	return torrent.ResumeDownload(ctx)
 }
 
 // AddTorrent registers one torrent with this process-level client.
-func (c *Client) RegisterTorrent(torrent *Torrent) error {
+func (c *Client) RegisterTorrent(torrent *torrent.Torrent) error {
 	if torrent == nil {
 		return fmt.Errorf("add torrent: torrent is nil")
 	}
@@ -143,15 +141,15 @@ func (c *Client) UnregisterTorrent(ctx context.Context, infoHash protocol.InfoHa
 // RunTorrent announces one registered torrent, connects the returned peers, and
 // runs its transfer loop until the context is canceled.
 
-func (c *Client) RunTorrent(ctx context.Context, infoHash protocol.InfoHash) error {
-	torrent, exists := c.getTorrent(infoHash)
+func (c *Client) StartTorrentDownload(ctx context.Context, infoHash protocol.InfoHash) error {
+	t, exists := c.getTorrent(infoHash)
 	if !exists {
-		return fmt.Errorf("run torrent: info hash %x is not registered", infoHash)
+		return ErrTorrentNotFound
 	}
 
-	config := torrentRunConfig{peerID: c.peerID, port: c.listenPort}
+	config := torrent.RunConfig{PeerID: c.peerID, Port: c.listenPort}
 
-	return torrent.run(ctx, config)
+	return t.RunDownload(ctx, config)
 }
 
 // ListenForPeers creates the client's peer listener and records its advertised
@@ -265,11 +263,11 @@ func (c *Client) handleIncomingConnection(ctx context.Context, conn net.Conn) er
 
 	}
 
-	return torrent.acceptIncomingPeer(ctx, conn, handshake, c.peerID)
+	return torrent.AcceptIncomingPeer(ctx, conn, handshake, c.peerID)
 
 }
 
-func (c *Client) getTorrent(infoHash protocol.InfoHash) (*Torrent, bool) {
+func (c *Client) getTorrent(infoHash protocol.InfoHash) (*torrent.Torrent, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -279,7 +277,7 @@ func (c *Client) getTorrent(infoHash protocol.InfoHash) (*Torrent, bool) {
 
 func (c *Client) closeTorrents() {
 	c.mu.RLock()
-	torrents := make([]*Torrent, 0, len(c.torrents))
+	torrents := make([]*torrent.Torrent, 0, len(c.torrents))
 	for _, torrent := range c.torrents {
 		torrents = append(torrents, torrent)
 	}
