@@ -66,14 +66,6 @@ func (p *peer) sendMessage(message protocol.Message) error {
 	return errPeerWriteQueueFull
 }
 
-func (t *Torrent) broadcastMessage(message protocol.Message) {
-	for _, peer := range t.peers {
-		if err := peer.sendMessage(message); err != nil {
-			t.removePeer(peer)
-		}
-	}
-}
-
 type peerEventKind uint8
 
 const (
@@ -88,31 +80,6 @@ type peerEvent struct {
 	peer    *peer
 	Message protocol.Message
 	Err     error
-}
-
-func (t *Torrent) handlePeerEvent(ctx context.Context, event peerEvent) {
-
-	switch event.kind {
-
-	case peerArrived:
-
-		err := t.activatePeer(ctx, event.peer)
-
-		if err != nil && event.peer != nil && event.peer.conn != nil {
-			t.closePeer(event.peer)
-
-		}
-	case peerMessageReceived:
-		if !t.hasPeer(event.peer) {
-			return
-		}
-		if err := t.handleProtocolMessage(event.peer, event.Message); err != nil {
-			t.removePeer(event.peer)
-		}
-	case peerDisconnected:
-		t.removePeer(event.peer)
-	}
-
 }
 
 func (p *peer) readLoop(ctx context.Context, events chan<- peerEvent) {
@@ -183,12 +150,4 @@ func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
 		}
 
 	}
-}
-
-func (t *Torrent) hasPeer(peer *peer) bool {
-	if peer == nil {
-		return false
-	}
-	current, exists := t.peers[peer.id]
-	return exists && current == peer
 }

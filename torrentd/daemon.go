@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/mattcattb/MoleSwarm/client"
 	"github.com/mattcattb/MoleSwarm/protocol"
 	"github.com/mattcattb/MoleSwarm/torrent"
 )
@@ -18,7 +19,7 @@ type managedTorrent struct {
 }
 
 type managedClient struct {
-	client   *torrent.Client
+	client   *client.Client
 	listener net.Listener
 	cancel   context.CancelFunc
 	done     chan error

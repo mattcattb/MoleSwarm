@@ -10,11 +10,11 @@ import (
 	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
-func (t *Torrent) announce(ctx context.Context, config torrentRunConfig, event tracker.AnnounceEvent) (tracker.AnnounceResponse, error) {
+func (t *Torrent) announce(ctx context.Context, config RunConfig, event tracker.AnnounceEvent) (tracker.AnnounceResponse, error) {
 
 	request := tracker.AnnounceRequest{
-		Port:       config.port,
-		PeerID:     config.peerID,
+		Port:       config.Port,
+		PeerID:     config.PeerID,
 		InfoHash:   t.Meta.InfoHash,
 		Uploaded:   t.uploaded,
 		Downloaded: t.downloaded,
