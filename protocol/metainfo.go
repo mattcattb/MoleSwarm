@@ -8,6 +8,12 @@ import (
 	"io"
 )
 
+type PeerID [20]byte
+
+type InfoHash [20]byte
+
+type PieceHash [20]byte
+
 type Info struct {
 	Name        string
 	Length      int64       // file length in bytes
@@ -17,48 +23,176 @@ type Info struct {
 
 // string whose length is a multiple of 20. It is to be subdivided into strings of length 20, each of which is the SHA1 hash of the piece at the corresponding index
 
+var (
+	ErrInvalidMetainfo = errors.New("invalid metainfo")
+)
+
 type MetaInfo struct {
 	Announce string // url of tracker
 	Info     Info
 	InfoHash InfoHash
 }
 
+func NewMetaInfo(announce string, info Info) (MetaInfo, error) {
+
+	if announce == "" {
+		return MetaInfo{}, ErrInvalidMetainfo
+	}
+
+	infoHash, err := hashInfo(info)
+
+	if err != nil {
+		return MetaInfo{}, err
+	}
+
+	return MetaInfo{
+		Announce: announce,
+		Info:     info,
+		InfoHash: infoHash,
+	}, nil
+}
+
+func ValidateAnnounceUrl(announce string) error {
+
+	if announce == "" {
+		return ErrInvalidMetainfo
+	}
+
+	return nil
+}
+
 const maxMetaInfoSize = 16 << 20
 
 func ReadMetaInfo(r io.Reader) (MetaInfo, error) {
-	data, err := io.ReadAll(io.LimitReader(r, maxMetaInfoSize+1))
-	if err != nil {
-		return MetaInfo{}, fmt.Errorf("read metainfo: %w", err)
-	}
-	if len(data) > maxMetaInfoSize {
-		return MetaInfo{}, fmt.Errorf("%w: metainfo exceeds %d bytes", invalidTorrentFile, maxMetaInfoSize)
-	}
 
-	bCoding, err := Decode(bytes.NewReader(data))
+	value, err := Decode(io.LimitReader(r, maxMetaInfoSize+1))
+
 	if err != nil {
 		return MetaInfo{}, err
 	}
 
-	metaDict, ok := bCoding.Dict()
+	return parseMetaInfo(value)
 
-	if !ok {
-		return MetaInfo{}, fmt.Errorf("invalid encoding")
+}
+func WriteMetainfo(w io.Writer, m MetaInfo) error {
+
+	mBencoding, err := metaInfoBencoding(m)
+
+	if err != nil {
+		return err
 	}
 
-	announce, ok := metaDict.String("announce")
+	return Encode(w, mBencoding)
+}
+func mashalPieceHashes(pieces []PieceHash) []byte {
+
+	bytes := make([]byte, 0, len(pieces)*len(PieceHash{}))
+
+	for _, ph := range pieces {
+		bytes = append(bytes, ph[:]...)
+	}
+
+	return bytes
+}
+
+func infoBencoding(info Info) (Bencoding, error) {
+
+	piecesBytes := mashalPieceHashes(info.PieceHashes)
+
+	bencoding := DictBencoding(BencodingDict{
+		"length":       IntegerBencoding(info.Length),
+		"name":         StringBencoding(info.Name),
+		"piece length": IntegerBencoding(info.PieceLength),
+		"pieces":       StringBencoding(string(piecesBytes)),
+	})
+	return bencoding, nil
+
+}
+
+func metaInfoBencoding(m MetaInfo) (Bencoding, error) {
+
+	infoValue, err := infoBencoding(m.Info)
+
+	if err != nil {
+		return Bencoding{}, err
+	}
+
+	return DictBencoding(BencodingDict{
+		"announce": StringBencoding(m.Announce),
+		"info":     infoValue,
+	}), nil
+
+}
+
+func hashInfo(info Info) (InfoHash, error) {
+
+	value, err := infoBencoding(info)
+	if err != nil {
+		return InfoHash{}, err
+	}
+
+	hasher := sha1.New()
+
+	if err := Encode(hasher, value); err != nil {
+		return InfoHash{}, fmt.Errorf(
+			"encode info dictionary: %w",
+			err,
+		)
+	}
+
+	var infoHash InfoHash
+	copy(infoHash[:], hasher.Sum(nil))
+
+	return infoHash, nil
+
+}
+
+// EncodeMetaInfo creates canonical single-file v1 metainfo from validated
+// content information. The returned bytes are suitable for distribution as a
+// .torrent file.
+func EncodeMetaInfo(m MetaInfo) ([]byte, error) {
+
+	metainfoValue, err := metaInfoBencoding(m)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var encoded bytes.Buffer
+	if err := Encode(&encoded, metainfoValue); err != nil {
+		return nil, err
+	}
+	return encoded.Bytes(), nil
+}
+
+var invalidTorrentFile = errors.New("invalid metainfo file")
+
+func parseMetaInfo(value Bencoding) (MetaInfo, error) {
+
+	mDict, ok := value.Dict()
+
+	if !ok {
+		return MetaInfo{}, ErrInvalidMetainfo
+	}
+
+	announce, ok := mDict.String("announce")
+
 	if !ok || announce == "" {
-		return MetaInfo{}, fmt.Errorf("%w: announce must be a non-empty string", invalidTorrentFile)
+		return MetaInfo{}, ErrInvalidMetainfo
 	}
 
-	infoValue, ok := metaDict["info"]
-	if !ok {
-		return MetaInfo{}, fmt.Errorf("%w: info dictionary is missing", invalidTorrentFile)
-	}
+	infoValue := mDict["info"]
 
-	mInfo, err := ParseInfo(infoValue)
+	info, err := ParseInfo(infoValue)
 
 	if err != nil {
 		return MetaInfo{}, err
+	}
+
+	//	infoHash, ok := mDict.String("infohash")
+
+	if !ok {
+		return MetaInfo{}, ErrInvalidMetainfo
 	}
 
 	var encodedInfo bytes.Buffer
@@ -68,45 +202,11 @@ func ReadMetaInfo(r io.Reader) (MetaInfo, error) {
 
 	return MetaInfo{
 		Announce: announce,
-		Info:     mInfo,
+		Info:     info,
 		InfoHash: InfoHash(sha1.Sum(encodedInfo.Bytes())),
 	}, nil
+
 }
-
-// EncodeMetaInfo creates canonical single-file v1 metainfo from validated
-// content information. The returned bytes are suitable for distribution as a
-// .torrent file.
-func EncodeMetaInfo(announce string, info Info) ([]byte, MetaInfo, error) {
-	if announce == "" {
-		return nil, MetaInfo{}, fmt.Errorf("%w: announce must be a non-empty string", invalidTorrentFile)
-	}
-
-	pieceBytes := make([]byte, 0, len(info.PieceHashes)*len(PieceHash{}))
-	for _, pieceHash := range info.PieceHashes {
-		pieceBytes = append(pieceBytes, pieceHash[:]...)
-	}
-	value := DictBencoding(BencodingDict{
-		"announce": StringBencoding(announce),
-		"info": DictBencoding(BencodingDict{
-			"length":       IntegerBencoding(info.Length),
-			"name":         StringBencoding(info.Name),
-			"piece length": IntegerBencoding(info.PieceLength),
-			"pieces":       StringBencoding(string(pieceBytes)),
-		}),
-	})
-
-	var encoded bytes.Buffer
-	if err := Encode(&encoded, value); err != nil {
-		return nil, MetaInfo{}, fmt.Errorf("encode metainfo: %w", err)
-	}
-	meta, err := ReadMetaInfo(bytes.NewReader(encoded.Bytes()))
-	if err != nil {
-		return nil, MetaInfo{}, fmt.Errorf("validate metainfo: %w", err)
-	}
-	return encoded.Bytes(), meta, nil
-}
-
-var invalidTorrentFile = errors.New("invalid metainfo file")
 
 func ParseInfo(info Bencoding) (Info, error) {
 	dict, ok := info.Dict()
@@ -167,4 +267,13 @@ func ParseInfo(info Bencoding) (Info, error) {
 		PieceHashes: pieces,
 		Length:      length,
 	}, nil
+}
+
+func HashPiece(data []byte) PieceHash {
+
+	return PieceHash(sha1.Sum(data))
+}
+
+func VerifyPiece(data []byte, expected PieceHash) bool {
+	return HashPiece(data) == expected
 }

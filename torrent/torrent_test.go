@@ -195,6 +195,139 @@ func TestTorrentReceivesAssignedBlockAndCompletesPiece(t *testing.T) {
 	}
 }
 
+func TestFileStorageAssemblesFinalizesAndReadsPiece(t *testing.T) {
+	data := []byte("ten-bytes!")
+	file, err := os.CreateTemp(t.TempDir(), "storage")
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	defer file.Close()
+
+	storage, err := newFileStorage(file, infoForTest(data), 4)
+	if err != nil {
+		t.Fatalf("new file storage: %v", err)
+	}
+	for begin := uint32(0); ; begin += storage.blockLength {
+		request, err := storage.blockRequest(0, begin)
+		if err != nil {
+			t.Fatalf("block request at %d: %v", begin, err)
+		}
+		assembled, err := storage.acceptBlock(request, data[begin:begin+request.Length])
+		if err != nil {
+			t.Fatalf("accept block at %d: %v", begin, err)
+		}
+		if begin+request.Length == uint32(len(data)) {
+			if !assembled {
+				t.Fatal("last block did not assemble piece")
+			}
+			break
+		}
+		if assembled {
+			t.Fatal("piece assembled before its final block")
+		}
+	}
+
+	job, err := storage.takeFinalizeJob(0)
+	if err != nil {
+		t.Fatalf("take finalize job: %v", err)
+	}
+	p, _ := storage.pieceAt(0)
+	if p.state != pieceFinalizing || p.buffer != nil {
+		t.Fatalf("piece retained buffer while finalizing: state=%v buffer=%v", p.state, p.buffer)
+	}
+
+	result := storage.verifyAndWritePiece(job)
+	if result.err != nil {
+		t.Fatalf("verify and write: %v", result.err)
+	}
+	if !storage.applyFinalizeResult(result) || !p.complete() {
+		t.Fatal("successful finalization did not complete piece")
+	}
+
+	request, err := storage.blockRequest(0, 4)
+	if err != nil {
+		t.Fatalf("read request: %v", err)
+	}
+	got, err := storage.readBlock(request)
+	if err != nil {
+		t.Fatalf("read block: %v", err)
+	}
+	if !bytes.Equal(got, data[4:8]) {
+		t.Fatalf("read block = %q, want %q", got, data[4:8])
+	}
+}
+
+func TestFileStorageHashFailureReturnsPieceToMissing(t *testing.T) {
+	expected := []byte("expected")
+	file, err := os.CreateTemp(t.TempDir(), "storage")
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	defer file.Close()
+
+	storage, err := newFileStorage(file, infoForTest(expected), defaultBlockLength)
+	if err != nil {
+		t.Fatalf("new file storage: %v", err)
+	}
+	request, err := storage.blockRequest(0, 0)
+	if err != nil {
+		t.Fatalf("block request: %v", err)
+	}
+	if assembled, err := storage.acceptBlock(request, []byte("bad-data")); err != nil || !assembled {
+		t.Fatalf("accept wrong block = (%t, %v), want (true, nil)", assembled, err)
+	}
+	job, err := storage.takeFinalizeJob(0)
+	if err != nil {
+		t.Fatalf("take finalize job: %v", err)
+	}
+	result := storage.verifyAndWritePiece(job)
+	if !errors.Is(result.err, ErrPieceHashMismatch) {
+		t.Fatalf("finalize error = %v, want hash mismatch", result.err)
+	}
+	if !storage.applyFinalizeResult(result) {
+		t.Fatal("hash failure result was not applied")
+	}
+	p, _ := storage.pieceAt(0)
+	if p.state != pieceMissing || p.buffer != nil || p.receivedBlocks != nil {
+		t.Fatalf("rejected piece invariant failed: state=%v buffer=%v blocks=%v", p.state, p.buffer, p.receivedBlocks)
+	}
+}
+
+func TestFileStorageRecheckKeepsOnlyVerifiedExistingPieces(t *testing.T) {
+	first := []byte("good")
+	second := []byte("data")
+	info := protocol.Info{
+		Name:        "fixture",
+		Length:      8,
+		PieceLength: 4,
+		PieceHashes: []protocol.PieceHash{protocol.HashPiece(first), protocol.HashPiece(second)},
+	}
+	file, err := os.CreateTemp(t.TempDir(), "resume")
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	defer file.Close()
+	if _, err := file.Write(append(first, []byte("nope")...)); err != nil {
+		t.Fatalf("write existing data: %v", err)
+	}
+
+	storage, err := newFileStorage(file, info, defaultBlockLength)
+	if err != nil {
+		t.Fatalf("new file storage: %v", err)
+	}
+	firstPiece, _ := storage.pieceAt(0)
+	secondPiece, _ := storage.pieceAt(1)
+	if !firstPiece.complete() || secondPiece.state != pieceMissing {
+		t.Fatalf("recheck states = (%v, %v), want (complete, missing)", firstPiece.state, secondPiece.state)
+	}
+	if got := storage.bytesLeft(); got != 4 {
+		t.Fatalf("bytes left = %d, want 4", got)
+	}
+	if got := storage.bitfield(); !bytes.Equal(got, []byte{0x80}) {
+		t.Fatalf("bitfield = %08b, want 10000000", got)
+	}
+}
+
 func infoForTest(data []byte) protocol.Info {
 	hash := protocol.PieceHash(sha1.Sum(data))
 	return protocol.Info{

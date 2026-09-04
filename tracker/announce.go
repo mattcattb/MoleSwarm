@@ -45,7 +45,7 @@ type AnnounceResponse struct {
 	Peers    []Peer
 }
 
-func encodeAnnounceRequest(announceURL string, request AnnounceRequest) (url.URL, error) {
+func buildAnnounceUrl(announceURL string, request AnnounceRequest) (url.URL, error) {
 	baseURL, err := url.Parse(announceURL)
 	if err != nil {
 		return url.URL{}, err
@@ -103,7 +103,7 @@ func parseStringQuery(query url.Values, key string) (string, error) {
 	return value, nil
 }
 
-func decodeAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
+func parseAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
 	query := request.URL.Query()
 
 	infoHashValue, err := parseStringQuery(query, "info_hash")
@@ -155,7 +155,7 @@ func decodeAnnounceRequest(request *http.Request) (AnnounceRequest, error) {
 	}, nil
 }
 
-func decodeTrackerResponse(value protocol.Bencoding) (AnnounceResponse, error) {
+func decodeAnnounceResponse(value protocol.Bencoding) (AnnounceResponse, error) {
 	body, ok := value.Dict()
 	if !ok {
 		return AnnounceResponse{}, fmt.Errorf("response bencoding was not a dictionary")
@@ -236,7 +236,7 @@ func parsePeer(value protocol.Bencoding) (Peer, error) {
 	return Peer{PeerID: peerID, IP: ip, Port: uint16(port)}, nil
 }
 
-func encodeTrackerResponse(response AnnounceResponse, compact bool) (protocol.Bencoding, error) {
+func encodeAnnounceResponse(response AnnounceResponse, compact bool) (protocol.Bencoding, error) {
 	if response.Interval < 0 || response.Interval%time.Second != 0 {
 		return protocol.Bencoding{}, fmt.Errorf("tracker interval %s is not a whole number of seconds", response.Interval)
 	}

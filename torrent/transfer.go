@@ -60,6 +60,7 @@ func (t *Torrent) handleProtocolMessage(peer *peer, message protocol.Message) er
 		return nil
 
 	case protocol.Piece:
+		//! this blocks everything in the protocol message...
 		completed, err := t.receiveBlock(peer, message)
 		if err != nil {
 			return err
@@ -86,6 +87,7 @@ func (t *Torrent) receiveBlock(peer *peer, message protocol.Piece) (bool, error)
 		return false, fmt.Errorf("unexpected block for piece %d at offset %d", message.PieceIndex, message.Begin)
 	}
 
+	//! recive block is important here
 	assembled, err := t.pieces.StoreBlock(request, message.Data)
 	if err != nil {
 		return false, err

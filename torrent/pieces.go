@@ -385,3 +385,5 @@ func (t *Torrent) PiecesBitfield() []byte {
 	}
 	return bits
 }
+
+func (t *Torrent) SyncPieceSet() {}
