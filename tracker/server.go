@@ -96,7 +96,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	announce, err := decodeAnnounceRequest(request)
+	announce, err := parseAnnounceRequest(request)
 	if err != nil {
 		s.writeFailure(w, "invalid announce request")
 		return
@@ -113,7 +113,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 
 	response := s.announce(announce, address.Addr().Unmap(), time.Now())
-	encoded, err := encodeTrackerResponse(response, announce.Compact)
+	encoded, err := encodeAnnounceResponse(response, announce.Compact)
 	if err != nil {
 		s.writeFailure(w, "unable to encode tracker response")
 		return

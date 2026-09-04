@@ -13,7 +13,7 @@ import (
 const maxResponseSize = 4 << 20
 
 func Announce(ctx context.Context, announceURL string, request AnnounceRequest) (AnnounceResponse, error) {
-	formattedURL, err := encodeAnnounceRequest(announceURL, request)
+	formattedURL, err := buildAnnounceUrl(announceURL, request)
 	if err != nil {
 		return AnnounceResponse{}, err
 	}
@@ -44,5 +44,5 @@ func Announce(ctx context.Context, announceURL string, request AnnounceRequest) 
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("decode tracker response: %w", err)
 	}
-	return decodeTrackerResponse(value)
+	return decodeAnnounceResponse(value)
 }
