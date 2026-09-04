@@ -1,122 +1,153 @@
 package torrent
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+
+	"github.com/mattcattb/MoleSwarm/protocol"
+	"github.com/mattcattb/MoleSwarm/tracker"
 )
 
-type PeerState struct {
+const peerWriteQueueSize = 32
+
+var errPeerWriteQueueFull = errors.New("peer write queue is full")
+
+type peerState struct {
 	AmChoking      bool
 	AmInterested   bool
 	PeerChoking    bool
 	PeerInterested bool
 }
 
-type Peer struct {
-	Conn     net.Conn
-	ID       PeerID
-	InfoHash InfoHash
-	State    PeerState
-	Bitfield []byte
+type peer struct {
+	conn     net.Conn
+	id       protocol.PeerID
+	infoHash protocol.InfoHash
+	incoming bool
+	state    peerState
+	bitfield []byte
+	outgoing chan protocol.Message
 }
 
-func DialPeer(ctx context.Context, peerRecord PeerRecord) (net.Conn, error) {
+func dialPeer(ctx context.Context, peerRecord tracker.Peer) (net.Conn, error) {
 	dialer := net.Dialer{}
 	return dialer.DialContext(ctx, "tcp", netip.AddrPortFrom(peerRecord.IP, peerRecord.Port).String())
 }
 
-func CompleteHandshake(conn net.Conn, info MetaInfo, peerId PeerID) (*Peer, error) {
-
-	buffWriter := bufio.NewWriter(conn)
-
-	if err := WritePeerHandshake(buffWriter, PeerHandshakeMessage{
-		InfoHash: info.InfoHash,
-		PeerID:   peerId,
-	}); err != nil {
-		return nil, err
-	}
-
-	// if connection dropped, does not have the info hash!
-	// uhhh maybe we await the other peer handshake? hmm
-
-	r := bufio.NewReader(conn)
-	handshakeMessage, err := ReadPeerHandshake(r)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return &Peer{
-		Conn:     conn,
-		ID:       handshakeMessage.PeerID,
-		InfoHash: handshakeMessage.InfoHash,
-		State: PeerState{
+func newPeer(conn net.Conn, handshake protocol.Handshake) *peer {
+	return &peer{
+		conn:     conn,
+		id:       handshake.PeerID,
+		infoHash: handshake.InfoHash,
+		state: peerState{
 			AmChoking:   true,
 			PeerChoking: true,
 		},
-	}, nil
+		outgoing: make(chan protocol.Message, peerWriteQueueSize),
+	}
 }
 
-func (p *Peer) HasPiece(index uint32) bool {
+func (p *peer) hasPiece(index uint32) bool {
 	byteIndex := index / 8
-	if int(byteIndex) >= len(p.Bitfield) {
+	if int(byteIndex) >= len(p.bitfield) {
 		return false
 	}
 
 	mask := byte(1 << (7 - index%8))
-	return p.Bitfield[byteIndex]&mask != 0
+	return p.bitfield[byteIndex]&mask != 0
 }
 
-func (p *Peer) sendMessage(msg PeerMessage) error {
-	return WriteMessage(p.Conn, msg)
+func (p *peer) sendMessage(message protocol.Message) error {
+	if p.tryEnqueue(message) {
+		return nil
+	}
+	return errPeerWriteQueueFull
 }
 
-type PeerEvent struct {
-	Peer    *Peer
-	Message PeerMessage
+type peerEventKind uint8
+
+const (
+	peerEventUnknown peerEventKind = iota
+	peerArrived
+	peerMessageReceived
+	peerDisconnected
+)
+
+type peerEvent struct {
+	kind    peerEventKind
+	peer    *peer
+	Message protocol.Message
 	Err     error
 }
 
-func (p *Peer) readLoop(ctx context.Context, events chan<- PeerEvent) {
+func (p *peer) readLoop(ctx context.Context, events chan<- peerEvent) {
 
 	for {
 
-		msg, err := ReadMessage(p.Conn)
-
-		event := PeerEvent{
-			Peer:    p,
-			Message: msg,
-			Err:     err,
+		msg, err := protocol.ReadMessage(p.conn)
+		if err != nil {
+			select {
+			case events <- peerEvent{
+				kind: peerDisconnected,
+				peer: p,
+				Err:  err,
+			}:
+			case <-ctx.Done():
+			}
+			return
 		}
 
 		select {
-		case events <- event:
+		case events <- peerEvent{
+			kind:    peerMessageReceived,
+			peer:    p,
+			Message: msg,
+		}:
 		case <-ctx.Done():
 			return
 		}
 
-		if err != nil {
+	}
+}
+
+func (p *peer) setPiece(index uint32) {
+	byteIndex := index / 8
+	if int(byteIndex) >= len(p.bitfield) {
+		p.bitfield = append(p.bitfield, make([]byte, int(byteIndex)+1-len(p.bitfield))...)
+	}
+
+	p.bitfield[byteIndex] |= byte(1 << (7 - index%8))
+}
+
+func (p *peer) tryEnqueue(message protocol.Message) bool {
+	select {
+	case p.outgoing <- message:
+		return true
+
+	default:
+		return false
+	}
+}
+
+func (p *peer) writeLoop(ctx context.Context, events chan<- peerEvent) {
+	for {
+
+		select {
+		case message := <-p.outgoing:
+			if err := protocol.WriteMessage(p.conn, message); err != nil {
+				select {
+				case events <- peerEvent{kind: peerDisconnected, peer: p, Err: err}:
+				case <-ctx.Done():
+
+				}
+				return
+			}
+
+		case <-ctx.Done():
 			return
 		}
 
 	}
 }
-
-func (p *Peer) setPieceHave(index uint32) {
-	byteIndex := index / 8
-	mask := byte(1 << (7 - index%8))
-	if int(byteIndex) >= len(p.Bitfield) {
-		p.Bitfield = append(p.Bitfield, make([]byte, int(byteIndex)+1-len(p.Bitfield))...)
-	}
-	p.Bitfield[byteIndex] |= mask
-}
-
-/*
-func (p *Peer) HandleIncomingPieces()
-
-func (p *Peer) CanRequest() bool {
-
-}
-*/

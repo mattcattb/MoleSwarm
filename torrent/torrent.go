@@ -2,53 +2,65 @@ package torrent
 
 import (
 	"context"
-	"crypto/rand"
-	"fmt"
+	"errors"
+	"net"
 	"os"
+	"sync"
+
+	"github.com/mattcattb/MoleSwarm/protocol"
+)
+
+var (
+	ErrAlreadyRunning = errors.New("torrent already running")
+	ErrNotRunning     = errors.New("torrent not running")
+	ErrStopped        = errors.New("torrent stopped")
 )
 
 type Torrent struct {
-	Meta MetaInfo
+	Meta protocol.MetaInfo
 
-	pieces  PieceSet
-	file    *os.File
-	pending map[BlockRequest]*Peer
+	// torrent run manages
+	pieces       PieceSet
+	file         *os.File
+	pending      map[protocol.BlockRequest]*peer
+	peers        map[protocol.PeerID]*peer
+	uploaded     uint64
+	downloaded   uint64
+	downloadMode downloadMode
+	TrackerID    string
 
-	Peers      map[PeerID]*Peer
-	peerEvents chan PeerEvent
+	// consumed by torrent.run
+	peerEvents           chan peerEvent
+	downloadModeRequests chan downloadModeRequest
+	statusRequests       chan statusRequest
 
-	PeerID     PeerID
-	listenPort uint16
-	TrackerID  string
-
-	uploaded   uint64
-	downloaded uint64
+	// lifecycle mu protects
+	lifecycleMu sync.Mutex
+	running     bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+	closeErr    error
 }
 
-func NewTorrent(meta MetaInfo, port uint16) (*Torrent, error) {
+func New(meta protocol.MetaInfo) (*Torrent, error) {
 	pieces, err := NewPieceSet(meta.Info)
 	if err != nil {
 		return nil, err
 	}
 
-	var peerID PeerID
-	if _, err := rand.Read(peerID[:]); err != nil {
-		return nil, fmt.Errorf("generate peer ID: %w", err)
-	}
-
 	return &Torrent{
-		Meta:       meta,
-		pieces:     pieces,
-		pending:    make(map[BlockRequest]*Peer),
-		Peers:      make(map[PeerID]*Peer),
-		peerEvents: make(chan PeerEvent),
-		PeerID:     peerID,
-		listenPort: port,
+		Meta:                 meta,
+		pieces:               pieces,
+		pending:              make(map[protocol.BlockRequest]*peer),
+		peers:                make(map[protocol.PeerID]*peer),
+		peerEvents:           make(chan peerEvent),
+		statusRequests:       make(chan statusRequest, 1),
+		downloadModeRequests: make(chan downloadModeRequest, 1),
 	}, nil
 }
 
-func OpenTorrent(meta MetaInfo, outputPath string) (*Torrent, error) {
-	torrent, err := NewTorrent(meta, 0)
+func OpenDownload(meta protocol.MetaInfo, outputPath string) (*Torrent, error) {
+	torrent, err := New(meta)
 	if err != nil {
 		return nil, err
 	}
@@ -66,75 +78,53 @@ func OpenTorrent(meta MetaInfo, outputPath string) (*Torrent, error) {
 	return torrent, nil
 }
 
+// OpenSeed opens existing data for upload and verifies every piece before the
+// session is allowed to advertise it to peers.
+func OpenSeed(meta protocol.MetaInfo, dataPath string) (*Torrent, error) {
+	torrent, err := New(meta)
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := os.Open(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := torrent.pieces.VerifyExisting(file); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	torrent.file = file
+	return torrent, nil
+}
+
 const maxPeers = int(5)
 
-func (t *Torrent) Start(ctx context.Context) error {
-	response, err := t.announce(ctx, StartedEvent)
+func (t *Torrent) pendingCount(peer *peer) int {
 
-	if err != nil {
-		return err
-	}
+	count := 0
 
-	for _, canidate := range response.Peers {
-		if len(t.Peers) > maxPeers {
-			break
-		}
-		if err := t.Connect(ctx, canidate); err != nil {
-			continue
+	for _, assignedPeer := range t.pending {
+		if assignedPeer == peer {
+			count += 1
 		}
 	}
 
-	return t.Run(ctx)
+	return count
 }
 
-func (t *Torrent) announce(ctx context.Context, event AnnounceEvent) (TrackerResponse, error) {
-	return Announce(ctx, t.Meta.Announce, TrackerAnnounceRequest{
-		Port:       t.listenPort,
-		Uploaded:   t.uploaded,
-		Downloaded: t.downloaded,
-		Left:       t.BytesLeft(),
-		InfoHash:   t.Meta.InfoHash,
-		PeerID:     t.PeerID,
-		Compact:    true,
-		Event:      event,
-	})
-}
+const maxPendingPerPeer = 8
 
-func (t *Torrent) Connect(ctx context.Context, candidate PeerRecord) error {
-	// make peer connection then add here?
-
-	conn, err := DialPeer(ctx, candidate)
-
-	if err != nil {
-		return err
-	}
-
-	peer, err := CompleteHandshake(conn, t.Meta, t.PeerID)
-
-	if err != nil {
-		conn.Close()
-		return err
-	}
-
-	if _, exists := t.Peers[peer.ID]; exists {
-		conn.Close()
-		return nil
-	}
-
-	t.Peers[peer.ID] = peer
-	go peer.readLoop(ctx, t.peerEvents)
-
-	return nil
-
-}
-
-func (t *Torrent) Close() error {
-	for _, peer := range t.Peers {
-		if peer.Conn != nil {
-			_ = peer.Conn.Close()
+func (t *Torrent) releasePendingRequests(peer *peer) {
+	for request, assignedPeer := range t.pending {
+		if assignedPeer == peer {
+			delete(t.pending, request)
 		}
 	}
+}
 
+func (t *Torrent) closeFile() error {
 	if t.file == nil {
 		return nil
 	}
@@ -144,249 +134,59 @@ func (t *Torrent) Close() error {
 	return err
 }
 
-func (t *Torrent) BytesLeft() uint64 {
-	return t.pieces.BytesLeft()
-}
-
-func (t *Torrent) Run(ctx context.Context) error {
-	for {
-		select {
-		case event := <-t.peerEvents:
-			if event.Err != nil {
-				t.removePeer(event.Peer)
-				continue
-			}
-
-			if err := t.handlePeerMessage(event.Peer, event.Message); err != nil {
-				t.removePeer(event.Peer)
-			}
-
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
-func (t *Torrent) NextRequest(peer *Peer) error {
-	if peer == nil {
-		return fmt.Errorf("cannot request a block without a peer")
-	}
-	if peer.State.PeerChoking || !peer.State.AmInterested {
+func (t *Torrent) changeDownloadMode(mode downloadMode) error {
+	if t.downloadMode == mode {
 		return nil
 	}
 
-	request, ok, err := t.reserveNextRequest(peer)
-	if err != nil || !ok {
-		return err
-	}
+	switch t.downloadMode {
+	case downloadModePaused:
+		// pause
+		t.downloadMode = downloadModePaused
+		t.broadcastMessage(protocol.NotInterested{})
+	case downloadModeProgress:
+		t.downloadMode = downloadModeProgress
 
-	if err := peer.sendMessage(Request{Block: request}); err != nil {
-		delete(t.pending, request)
-		return err
+		t.broadcastMessage(protocol.Interested{})
+		// ! TODO maybe refil areas here? depends if we pause the blocks and areas here
 	}
-
 	return nil
 }
 
-func (t *Torrent) reserveNextRequest(peer *Peer) (BlockRequest, bool, error) {
-	for index := 0; index < t.pieces.Count(); index++ {
-		pieceIndex := uint32(index)
-		if t.pieces.IsComplete(pieceIndex) || !peer.HasPiece(pieceIndex) {
-			continue
-		}
+func (t *Torrent) AcceptIncomingPeer(ctx context.Context, conn net.Conn, handshake protocol.Handshake, peerId protocol.PeerID) error {
+	t.lifecycleMu.Lock()
+	running := t.running
+	done := t.done
+	t.lifecycleMu.Unlock()
 
-		request, ok, err := t.pieces.nextMissingBlock(pieceIndex, func(request BlockRequest) bool {
-			_, pending := t.pending[request]
-			return pending
-		})
-		if err != nil || !ok {
-			if err != nil {
-				return BlockRequest{}, false, err
-			}
-			continue
-		}
-
-		t.pending[request] = peer
-		return request, true, nil
+	if !running {
+		return ErrAlreadyRunning
 	}
 
-	return BlockRequest{}, false, nil
-}
-
-func (t *Torrent) receiveBlock(peer *Peer, message Piece) (bool, error) {
-	request := BlockRequest{
-		PieceIndex: message.PieceIndex,
-		Begin:      message.Begin,
-		Length:     uint32(len(message.Data)),
-	}
-
-	assignedPeer, pending := t.pending[request]
-	if !pending || assignedPeer != peer {
-		return false, fmt.Errorf("unexpected block for piece %d at offset %d", message.PieceIndex, message.Begin)
-	}
-
-	assembled, err := t.pieces.StoreBlock(request, message.Data)
-	if err != nil {
-		return false, err
-	}
-
-	delete(t.pending, request)
-	t.downloaded += uint64(len(message.Data))
-
-	if !assembled {
-		return false, nil
-	}
-
-	if err := t.pieces.VerifyAndWrite(message.PieceIndex, t.file); err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
-func (t *Torrent) serveBlock(peer *Peer, request BlockRequest) error {
-	if peer == nil || peer.State.AmChoking {
-		return nil
-	}
-
-	data, err := t.pieces.ReadBlock(request, t.file)
-	if err != nil {
-		return err
-	}
-	if err := peer.sendMessage(Piece{
-		PieceIndex: request.PieceIndex,
-		Begin:      request.Begin,
-		Data:       data,
-	}); err != nil {
+	if err := validatePeerHandshake(handshake, t.Meta.InfoHash, peerId); err != nil {
 		return err
 	}
 
-	t.uploaded += uint64(len(data))
-	return nil
-}
-
-func (t *Torrent) handlePeerMessage(peer *Peer, message PeerMessage) error {
-	if peer == nil {
-		return fmt.Errorf("peer message has no peer")
-	}
-
-	switch message := message.(type) {
-	case KeepAlive:
-		return nil
-
-	case Choke:
-		peer.State.PeerChoking = true
-		t.releasePendingRequests(peer)
-		return nil
-
-	case Unchoke:
-		peer.State.PeerChoking = false
-		return t.NextRequest(peer)
-
-	case Interested:
-		peer.State.PeerInterested = true
-		return nil
-
-	case NotInterested:
-		peer.State.PeerInterested = false
-		return nil
-
-	case Have:
-		t.setPeerPiece(peer, message.PieceIndex)
-
-		if err := t.updateInterest(peer); err != nil {
-			return err
-		}
-		return t.NextRequest(peer)
-
-	case Bitfield:
-		peer.Bitfield = append(peer.Bitfield[:0], message.Bits...)
-		if err := t.updateInterest(peer); err != nil {
-			return err
-		}
-		return t.NextRequest(peer)
-
-	case Request:
-		return t.serveBlock(peer, message.Block)
-
-	case CancelRequest:
-		return nil
-
-	case Piece:
-		completed, err := t.receiveBlock(peer, message)
-		if err != nil {
-			return err
-		}
-		if completed {
-			t.broadcastMessage(Have{PieceIndex: message.PieceIndex})
-		}
-		return t.NextRequest(peer)
-	}
-
-	return nil
-}
-
-func (t *Torrent) updateInterest(peer *Peer) error {
-	interested := false
-	for index := 0; index < t.pieces.Count(); index++ {
-		pieceIndex := uint32(index)
-		if !t.pieces.IsComplete(pieceIndex) && peer.HasPiece(pieceIndex) {
-			interested = true
-			break
-		}
-	}
-
-	if interested == peer.State.AmInterested {
-		return nil
-	}
-
-	if interested {
-		if err := peer.sendMessage(Interested{}); err != nil {
-			return err
-		}
-	} else if err := peer.sendMessage(NotInterested{}); err != nil {
+	if err := writePeerHandshake(conn, t.Meta.InfoHash, peerId); err != nil {
 		return err
 	}
 
-	peer.State.AmInterested = interested
-	return nil
-}
+	peer := newPeer(conn, handshake)
 
-func (t *Torrent) setPeerPiece(peer *Peer, index uint32) {
-	byteIndex := index / 8
-	if int(byteIndex) >= len(peer.Bitfield) {
-		peer.Bitfield = append(peer.Bitfield, make([]byte, int(byteIndex)+1-len(peer.Bitfield))...)
+	peer.incoming = true
+
+	select {
+	case t.peerEvents <- peerEvent{
+		kind: peerArrived,
+		peer: peer,
+	}:
+		return nil
+
+	case <-ctx.Done():
+		return ctx.Err()
+
+	case <-done:
+		return ErrStopped
 	}
 
-	peer.Bitfield[byteIndex] |= byte(1 << (7 - index%8))
-}
-
-func (t *Torrent) releasePendingRequests(peer *Peer) {
-	for request, assignedPeer := range t.pending {
-		if assignedPeer == peer {
-			delete(t.pending, request)
-		}
-	}
-}
-
-func (t *Torrent) broadcastMessage(message PeerMessage) {
-	for _, peer := range t.Peers {
-		if err := peer.sendMessage(message); err != nil {
-			t.removePeer(peer)
-		}
-	}
-}
-
-func (t *Torrent) removePeer(peer *Peer) {
-	if peer == nil {
-		return
-	}
-
-	t.releasePendingRequests(peer)
-	if current, ok := t.Peers[peer.ID]; ok && current == peer {
-		delete(t.Peers, peer.ID)
-	}
-	if peer.Conn != nil {
-		_ = peer.Conn.Close()
-	}
 }

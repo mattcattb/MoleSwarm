@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/mattcattb/MoleSwarm/protocol"
 )
 
 const blockSize uint32 = 16 * 1024
@@ -21,11 +23,11 @@ type PieceState struct {
 // PieceSet owns the local, verified view of a torrent's content. It does not
 // know which peers exist or which peer owns an outstanding request.
 type PieceSet struct {
-	info   Info
+	info   protocol.Info
 	states []PieceState
 }
 
-func NewPieceSet(info Info) (PieceSet, error) {
+func NewPieceSet(info protocol.Info) (PieceSet, error) {
 	if info.Length < 0 {
 		return PieceSet{}, fmt.Errorf("torrent length cannot be negative")
 	}
@@ -56,6 +58,16 @@ func NewPieceSet(info Info) (PieceSet, error) {
 
 func (p *PieceSet) Count() int {
 	return len(p.states)
+}
+
+func (p *PieceSet) CompletedCount() int {
+	complete := 0
+	for _, state := range p.states {
+		if state.Complete {
+			complete++
+		}
+	}
+	return complete
 }
 
 func (p *PieceSet) IsComplete(index uint32) bool {
@@ -138,10 +150,10 @@ func (p *PieceSet) prepare(index uint32) error {
 
 func (p *PieceSet) nextMissingBlock(
 	index uint32,
-	isPending func(BlockRequest) bool,
-) (BlockRequest, bool, error) {
+	isPending func(protocol.BlockRequest) bool,
+) (protocol.BlockRequest, bool, error) {
 	if err := p.prepare(index); err != nil {
-		return BlockRequest{}, false, err
+		return protocol.BlockRequest{}, false, err
 	}
 
 	piece := &p.states[index]
@@ -152,18 +164,18 @@ func (p *PieceSet) nextMissingBlock(
 
 		request, err := p.blockRequest(index, uint32(blockIndex)*blockSize)
 		if err != nil {
-			return BlockRequest{}, false, err
+			return protocol.BlockRequest{}, false, err
 		}
 		if !isPending(request) {
 			return request, true, nil
 		}
 	}
 
-	return BlockRequest{}, false, nil
+	return protocol.BlockRequest{}, false, nil
 }
 
 func (p *PieceSet) StoreBlock(
-	request BlockRequest,
+	request protocol.BlockRequest,
 	data []byte,
 ) (bool, error) {
 	expected, err := p.blockRequest(request.PieceIndex, request.Begin)
@@ -204,7 +216,7 @@ func (p *PieceSet) VerifyAndWrite(index uint32, file *os.File) error {
 		return fmt.Errorf("piece %d is incomplete", index)
 	}
 
-	if PieceHash(sha1.Sum(piece.Data)) != p.info.PieceHashes[index] {
+	if protocol.PieceHash(sha1.Sum(piece.Data)) != p.info.PieceHashes[index] {
 		piece.Data = nil
 		piece.Received = nil
 		return fmt.Errorf("piece %d: %w", index, ErrPieceHashMismatch)
@@ -229,7 +241,54 @@ func (p *PieceSet) VerifyAndWrite(index uint32, file *os.File) error {
 	return nil
 }
 
-func (p *PieceSet) ReadBlock(request BlockRequest, file *os.File) ([]byte, error) {
+// VerifyExisting marks every piece in file as available only after checking it
+// against the hashes in the metainfo. It is used before a session seeds data
+// that already exists on disk.
+func (p *PieceSet) VerifyExisting(file *os.File) error {
+	if file == nil {
+		return fmt.Errorf("torrent data file is not open")
+	}
+
+	for index := range p.states {
+		pieceIndex := uint32(index)
+		length, err := p.PieceLength(pieceIndex)
+		if err != nil {
+			return err
+		}
+		offset, err := p.PieceOffset(pieceIndex)
+		if err != nil {
+			return err
+		}
+
+		data := make([]byte, length)
+		read, err := file.ReadAt(data, offset)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read piece %d: %w", pieceIndex, err)
+		}
+		if read != len(data) {
+			return fmt.Errorf("read piece %d: %w", pieceIndex, io.ErrUnexpectedEOF)
+		}
+		if protocol.PieceHash(sha1.Sum(data)) != p.info.PieceHashes[pieceIndex] {
+			return fmt.Errorf("verify piece %d: %w", pieceIndex, ErrPieceHashMismatch)
+		}
+
+		p.states[pieceIndex].Complete = true
+	}
+	return nil
+}
+
+func bitCount(bits []byte, pieceCount int) int {
+	count := 0
+	for index := 0; index < pieceCount; index++ {
+		byteIndex := index / 8
+		if byteIndex < len(bits) && bits[byteIndex]&(1<<uint(7-index%8)) != 0 {
+			count++
+		}
+	}
+	return count
+}
+
+func (p *PieceSet) ReadBlock(request protocol.BlockRequest, file *os.File) ([]byte, error) {
 	if file == nil {
 		return nil, fmt.Errorf("torrent output file is not open")
 	}
@@ -262,22 +321,22 @@ func (p *PieceSet) ReadBlock(request BlockRequest, file *os.File) ([]byte, error
 	return data, nil
 }
 
-func (p *PieceSet) blockRequest(index, begin uint32) (BlockRequest, error) {
+func (p *PieceSet) blockRequest(index, begin uint32) (protocol.BlockRequest, error) {
 	if begin%blockSize != 0 {
-		return BlockRequest{}, fmt.Errorf("block offset %d is not aligned", begin)
+		return protocol.BlockRequest{}, fmt.Errorf("block offset %d is not aligned", begin)
 	}
 
 	pieceLength, err := p.PieceLength(index)
 	if err != nil {
-		return BlockRequest{}, err
+		return protocol.BlockRequest{}, err
 	}
 
 	length := requestLength(pieceLength, begin)
 	if length == 0 {
-		return BlockRequest{}, fmt.Errorf("block offset %d is outside piece %d", begin, index)
+		return protocol.BlockRequest{}, fmt.Errorf("block offset %d is outside piece %d", begin, index)
 	}
 
-	return BlockRequest{
+	return protocol.BlockRequest{
 		PieceIndex: index,
 		Begin:      begin,
 		Length:     length,
@@ -314,3 +373,17 @@ func allBlocksReceived(piece *PieceState) bool {
 
 	return true
 }
+
+func (t *Torrent) PiecesBitfield() []byte {
+	bits := make([]byte, (t.pieces.Count()+7)/8)
+	for index := 0; index < t.pieces.Count(); index++ {
+		if !t.pieces.IsComplete(uint32(index)) {
+			continue
+		}
+		byteIndex := index / 8
+		bits[byteIndex] |= 1 << (7 - uint(index)%8)
+	}
+	return bits
+}
+
+func (t *Torrent) SyncPieceSet() {}

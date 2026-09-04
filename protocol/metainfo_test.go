@@ -1,8 +1,9 @@
-package torrent
+package protocol
 
 import (
 	"bytes"
 	"crypto/sha1"
+	"reflect"
 	"testing"
 )
 
@@ -43,6 +44,27 @@ func TestReadMetaInfoParsesSingleFileAndComputesInfoHash(t *testing.T) {
 	}
 	if got, want := meta.InfoHash, InfoHash(sha1.Sum(infoBytes)); got != want {
 		t.Fatalf("info hash = %x, want %x", got, want)
+	}
+}
+
+func TestEncodeMetaInfoProducesParseableCanonicalMetainfo(t *testing.T) {
+	pieceHash := PieceHash(sha1.Sum([]byte("hello")))
+	encoded, meta, err := EncodeMetaInfo("https://tracker.test/announce", Info{
+		Name:        "hello.txt",
+		Length:      5,
+		PieceLength: 16 * 1024,
+		PieceHashes: []PieceHash{pieceHash},
+	})
+	if err != nil {
+		t.Fatalf("encode metainfo: %v", err)
+	}
+
+	parsed, err := ReadMetaInfo(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatalf("read encoded metainfo: %v", err)
+	}
+	if got, want := parsed, meta; !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsed metainfo = %#v, want %#v", got, want)
 	}
 }
 

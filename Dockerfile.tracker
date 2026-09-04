@@ -1,0 +1,27 @@
+FROM golang:1.25.6-bookworm AS build
+
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+
+COPY . ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/tracker ./cmd/tracker
+
+FROM alpine:3.22
+
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="MoleSwarm tracker" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${REVISION}" \
+    org.opencontainers.image.source="https://github.com/mattcattb/MoleSwarm"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S app \
+    && adduser -S -G app -u 10001 app
+
+COPY --from=build --chown=app:app /out/tracker /usr/local/bin/tracker
+USER app
+EXPOSE 6969 8080
+ENTRYPOINT ["/usr/local/bin/tracker"]
+CMD ["serve"]

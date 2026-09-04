@@ -1,0 +1,28 @@
+FROM golang:1.25.6-bookworm AS build
+
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+
+COPY . ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/torrent ./cmd/torrent
+
+FROM alpine:3.22
+
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="MoleSwarm client" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${REVISION}" \
+    org.opencontainers.image.source="https://github.com/mattcattb/MoleSwarm"
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S app \
+    && adduser -S -G app -u 10001 app \
+    && mkdir /data \
+    && chown app:app /data
+
+COPY --from=build --chown=app:app /out/torrent /usr/local/bin/torrent
+USER app
+EXPOSE 6881 8080
+ENTRYPOINT ["/usr/local/bin/torrent"]
