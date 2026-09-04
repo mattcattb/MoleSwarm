@@ -89,12 +89,13 @@ func (t *Torrent) Start(ctx context.Context) error {
 
 func (t *Torrent) announce(ctx context.Context, event AnnounceEvent) (TrackerResponse, error) {
 	return Announce(ctx, t.Meta.Announce, TrackerAnnounceRequest{
-		port:       t.listenPort,
-		uploaded:   t.uploaded,
-		downloaded: t.downloaded,
-		left:       t.BytesLeft(),
+		Port:       t.listenPort,
+		Uploaded:   t.uploaded,
+		Downloaded: t.downloaded,
+		Left:       t.BytesLeft(),
 		InfoHash:   t.Meta.InfoHash,
 		PeerID:     t.PeerID,
+		Compact:    true,
 		Event:      event,
 	})
 }
